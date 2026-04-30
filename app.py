@@ -511,7 +511,7 @@ with left_col:
     manual_codes_text = st.text_area(
         "Product codes",
         placeholder="Example:\n046677568283\n046677568290\n046677568306",
-        height=70,
+        height=65,
         label_visibility="collapsed",
     )
 
