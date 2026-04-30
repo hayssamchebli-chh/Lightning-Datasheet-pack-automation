@@ -581,7 +581,7 @@ settings_col_1, settings_col_2 = st.columns([2, 1], gap="large")
 with settings_col_1:
     output_filename = st.text_input(
         "Output PDF filename",
-        value="philips_datasheets_pack.pdf",
+        value="philips datasheets pack.pdf",
     )
 
 with settings_col_2:
