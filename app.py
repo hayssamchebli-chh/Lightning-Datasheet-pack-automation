@@ -592,13 +592,7 @@ with settings_col_2:
 manual_codes = extract_codes_from_text(manual_codes_text)
 all_codes = dedupe_preserve_order(manual_codes + excel_codes)
 
-st.markdown(
-    """
-    <div class="info-strip">
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+
 
 st.markdown("### Summary before download")
 
