@@ -595,9 +595,6 @@ all_codes = dedupe_preserve_order(manual_codes + excel_codes)
 st.markdown(
     """
     <div class="info-strip">
-        The tool builds URLs using this pattern:
-        <strong>https://www.assets.signify.com/is/content/Signify/US.en_US.{code}</strong>
-        and verifies that the returned file is a real PDF.
     </div>
     """,
     unsafe_allow_html=True,
