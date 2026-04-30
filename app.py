@@ -662,7 +662,7 @@ results = [
     results_by_code[code]
     for code in all_codes
     if code in results_by_code
-]
+        ]
 
     successful = [item for item in results if item["success"]]
     failed = [item for item in results if not item["success"]]
