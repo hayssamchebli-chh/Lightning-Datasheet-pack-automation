@@ -27,13 +27,19 @@ def normalize_code(value: str) -> str:
     """
     Clean Philips / Signify product code.
 
-    Example:
+    Supports values like:
+    HE-046677590543 -> 046677590543
+    HE-046677591670 -> 046677591670
     046677568283 -> 046677568283
     """
     if value is None:
         return ""
 
     value = str(value).strip()
+
+    # If the value contains a dash, keep only the part after the first dash
+    if "-" in value:
+        value = value.split("-", 1)[1]
 
     # Remove spaces, commas, semicolons, tabs
     value = re.sub(r"[\s,;]+", "", value)
