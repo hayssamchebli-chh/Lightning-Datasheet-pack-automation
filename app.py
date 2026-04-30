@@ -635,33 +635,33 @@ if download_button:
 
     st.info("Downloading Philips / Signify datasheets...")
 
-results_by_code = {}
-progress_bar = st.progress(0)
-status_text = st.empty()
-
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    future_map = {
-        executor.submit(download_datasheet, code): code
+    results_by_code = {}
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {
+            executor.submit(download_datasheet, code): code
+            for code in all_codes
+        }
+    
+        completed = 0
+    
+        for future in as_completed(future_map):
+            code = future_map[future]
+            result = future.result()
+    
+            results_by_code[code] = result
+    
+            completed += 1
+            progress_bar.progress(completed / len(all_codes))
+            status_text.write(f"Processed {completed} / {len(all_codes)}")
+    
+    # Rebuild results in the same order as the original input
+    results = [
+        results_by_code[code]
         for code in all_codes
-    }
-
-    completed = 0
-
-    for future in as_completed(future_map):
-        code = future_map[future]
-        result = future.result()
-
-        results_by_code[code] = result
-
-        completed += 1
-        progress_bar.progress(completed / len(all_codes))
-        status_text.write(f"Processed {completed} / {len(all_codes)}")
-
-# Rebuild results in the same order as the original input
-results = [
-    results_by_code[code]
-    for code in all_codes
-    if code in results_by_code
+        if code in results_by_code
         ]
 
     successful = [item for item in results if item["success"]]
