@@ -693,9 +693,13 @@ st.markdown(
 
 st.markdown(
     """
-    <div class="philips-topbar">
-        <div class="philips-logo">PHILIPS</div>
-        <div class="philips-badge">Philips & Zambelis Datasheet Automation</div>
+    <div class="brand-topbar">
+        <div class="brand-logos">
+            <div class="philips-logo">PHILIPS</div>
+            <div class="brand-divider"></div>
+            <div class="zambelis-logo">ZAMBELIS</div>
+        </div>
+        <div class="brand-badge">Philips & Zambelis Datasheet Automation</div>
     </div>
 
     <div class="hero">
