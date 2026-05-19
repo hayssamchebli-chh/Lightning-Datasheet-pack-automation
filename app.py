@@ -2,6 +2,7 @@ import io
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 
 import pandas as pd
 import requests
@@ -13,7 +14,13 @@ from pypdf import PdfReader, PdfWriter
 # Configuration
 # ============================================================
 
-BASE_URL = "https://www.assets.signify.com/is/content/Signify/US.en_US.{code}"
+PHILIPS_BASE_URL = "https://www.assets.signify.com/is/content/Signify/US.en_US.{code}"
+
+ZAMBELIS_URL_PATTERNS = [
+    "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet_{code}.pdf",
+    "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet...%20{code}.pdf",
+    "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet%20...%20{code}.pdf",
+]
 
 DEFAULT_TIMEOUT = (20, 40)  # connect timeout, read timeout
 MAX_WORKERS = 8
@@ -25,29 +32,59 @@ MAX_WORKERS = 8
 
 def normalize_code(value: str) -> str:
     """
-    Clean Philips / Signify product code.
+    Clean product code.
 
-    Supports values like:
-    HE-046677590543 -> 046677590543
-    HE-046677591670 -> 046677591670
-    046677568283 -> 046677568283
+    Expected prefixes:
+    PHL = Philips / Signify product
+    ZMB = Zambelis product
+
+    Examples:
+    PHL-046677590543 -> PHL046677590543
+    PHL 046677590543 -> PHL046677590543
+    ZMB-12345 -> ZMB12345
     """
     if value is None:
         return ""
 
     value = str(value).strip()
 
-    # If the value contains a dash, keep only the part after the first dash
-    if "-" in value:
-        value = value.split("-", 1)[1]
-
     # Remove spaces, commas, semicolons, tabs
     value = re.sub(r"[\s,;]+", "", value)
 
-    # Keep only letters and numbers
-    value = re.sub(r"[^A-Za-z0-9]", "", value)
+    # Keep only letters, numbers, dash, underscore, and dot temporarily
+    value = re.sub(r"[^A-Za-z0-9\-_\.]", "", value)
 
-    return value
+    return value.upper()
+
+
+def get_product_type(code: str) -> str:
+    """
+    Detect product type from prefix.
+    """
+    if code.startswith("PHL"):
+        return "philips"
+
+    if code.startswith("ZMB"):
+        return "zambelis"
+
+    return "unknown"
+
+
+def strip_product_prefix(code: str) -> str:
+    """
+    Remove PHL or ZMB prefix before searching vendor websites.
+    Also removes optional separators after the prefix.
+    """
+    if code.startswith("PHL"):
+        cleaned = code[3:]
+    elif code.startswith("ZMB"):
+        cleaned = code[3:]
+    else:
+        cleaned = code
+
+    cleaned = cleaned.lstrip("-_.")
+
+    return cleaned
 
 
 def extract_codes_from_text(text: str) -> list[str]:
@@ -110,12 +147,27 @@ def is_pdf_bytes(content: bytes) -> bool:
     return content[:5] == b"%PDF-"
 
 
-def download_datasheet(code: str) -> dict:
+def validate_pdf_content(content: bytes):
+    """
+    Validate downloaded PDF content.
+    """
+    if not content:
+        raise ValueError("Empty response")
+
+    if not is_pdf_bytes(content):
+        raise ValueError("Downloaded file does not start with %PDF")
+
+    PdfReader(io.BytesIO(content))
+
+
+def download_philips_datasheet(code: str) -> dict:
     """
     Download one Philips / Signify datasheet.
-    The URL does not end with .pdf, so we verify using Content-Type and %PDF signature.
+    The user enters code starting with PHL.
+    The PHL prefix is removed before searching Signify.
     """
-    url = BASE_URL.format(code=code)
+    search_code = strip_product_prefix(code)
+    url = PHILIPS_BASE_URL.format(code=search_code)
 
     try:
         response = requests.get(
@@ -133,6 +185,7 @@ def download_datasheet(code: str) -> dict:
         if response.status_code != 200:
             return {
                 "code": code,
+                "brand": "Philips",
                 "success": False,
                 "url": url,
                 "error": f"HTTP {response.status_code}",
@@ -142,26 +195,18 @@ def download_datasheet(code: str) -> dict:
         if "application/pdf" not in content_type and not is_pdf_bytes(content):
             return {
                 "code": code,
+                "brand": "Philips",
                 "success": False,
                 "url": url,
                 "error": f"Not a PDF. Content-Type: {content_type}",
                 "content": None,
             }
 
-        if not is_pdf_bytes(content):
-            return {
-                "code": code,
-                "success": False,
-                "url": url,
-                "error": "Downloaded file does not start with %PDF",
-                "content": None,
-            }
-
-        # Validate that pypdf can read it
-        PdfReader(io.BytesIO(content))
+        validate_pdf_content(content)
 
         return {
             "code": code,
+            "brand": "Philips",
             "success": True,
             "url": url,
             "error": "",
@@ -171,11 +216,105 @@ def download_datasheet(code: str) -> dict:
     except Exception as e:
         return {
             "code": code,
+            "brand": "Philips",
             "success": False,
             "url": url,
             "error": str(e),
             "content": None,
         }
+
+
+def download_zambelis_datasheet(code: str) -> dict:
+    """
+    Download one Zambelis datasheet.
+
+    The user enters code starting with ZMB.
+    The ZMB prefix is removed before searching Zambelis.
+
+    Search order:
+    1. Datasheet_{code}.pdf
+    2. Datasheet...%20{code}.pdf
+    3. Datasheet%20...%20{code}.pdf
+    """
+    search_code = strip_product_prefix(code)
+
+    # Encode only unsafe characters in the product code.
+    # Keep common product separators safe.
+    encoded_code = quote(search_code, safe="-_.")
+
+    attempted_urls = []
+    last_error = ""
+
+    for pattern in ZAMBELIS_URL_PATTERNS:
+        url = pattern.format(code=encoded_code)
+        attempted_urls.append(url)
+
+        try:
+            response = requests.get(
+                url,
+                timeout=DEFAULT_TIMEOUT,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/pdf,*/*",
+                },
+            )
+
+            content_type = response.headers.get("Content-Type", "").lower()
+            content = response.content or b""
+
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+
+            if "application/pdf" not in content_type and not is_pdf_bytes(content):
+                last_error = f"Not a PDF. Content-Type: {content_type}"
+                continue
+
+            validate_pdf_content(content)
+
+            return {
+                "code": code,
+                "brand": "Zambelis",
+                "success": True,
+                "url": url,
+                "error": "",
+                "content": content,
+            }
+
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return {
+        "code": code,
+        "brand": "Zambelis",
+        "success": False,
+        "url": " | ".join(attempted_urls),
+        "error": f"Not found after trying all 3 Zambelis links. Last error: {last_error}",
+        "content": None,
+    }
+
+
+def download_datasheet(code: str) -> dict:
+    """
+    Route product code to the correct vendor downloader.
+    """
+    product_type = get_product_type(code)
+
+    if product_type == "philips":
+        return download_philips_datasheet(code)
+
+    if product_type == "zambelis":
+        return download_zambelis_datasheet(code)
+
+    return {
+        "code": code,
+        "brand": "Unknown",
+        "success": False,
+        "url": "",
+        "error": "Unknown code prefix. Code must start with PHL or ZMB.",
+        "content": None,
+    }
 
 
 def merge_pdfs(downloads: list[dict]) -> bytes:
@@ -203,7 +342,7 @@ def merge_pdfs(downloads: list[dict]) -> bytes:
 # ============================================================
 
 st.set_page_config(
-    page_title="Philips Datasheet Pack Builder",
+    page_title="Datasheet Pack Builder",
     page_icon="💡",
     layout="wide",
 )
@@ -478,16 +617,17 @@ st.markdown(
     """
     <div class="philips-topbar">
         <div class="philips-logo">PHILIPS</div>
-        <div class="philips-badge">Signify Datasheet Automation</div>
+        <div class="philips-badge">Philips & Zambelis Datasheet Automation</div>
     </div>
 
     <div class="hero">
         <div class="hero-content">
             <div class="hero-kicker">Product documentation tool</div>
-            <h1>Philips Datasheet Pack Builder</h1>
+            <h1>Datasheet Pack Builder</h1>
             <p>
-                Paste Philips / Signify product codes, upload Excel lists,
-                download official datasheets, and merge everything into one clean PDF pack.
+                Paste product codes, upload Excel lists, download official datasheets,
+                and merge everything into one clean PDF pack.
+                Use PHL for Philips products and ZMB for Zambelis products.
             </p>
         </div>
     </div>
@@ -508,7 +648,7 @@ with left_col:
         <div class="tool-card">
             <div class="section-title">Paste product codes</div>
             <div class="section-subtitle">
-                Add one or multiple Philips / Signify product codes.
+                Add one or multiple product codes. Use PHL for Philips and ZMB for Zambelis.
             </div>
         """,
         unsafe_allow_html=True,
@@ -516,7 +656,7 @@ with left_col:
 
     manual_codes_text = st.text_area(
         "Product codes",
-        placeholder="Example:\n046677568283",
+        placeholder="Example:\nPHL046677568283\nZMB12345",
         height=65,
         label_visibility="collapsed",
     )
@@ -530,7 +670,7 @@ with right_col:
         <div class="tool-card">
             <div class="section-title">Upload Excel file</div>
             <div class="section-subtitle">
-                Select the column that contains the Philips product codes.
+                Select the column that contains the product codes.
             </div>
         """,
         unsafe_allow_html=True,
@@ -581,7 +721,7 @@ settings_col_1, settings_col_2 = st.columns([2, 1], gap="large")
 with settings_col_1:
     output_filename = st.text_input(
         "Output PDF filename",
-        value="philips datasheets pack.pdf",
+        value="datasheets pack.pdf",
     )
 
 with settings_col_2:
@@ -598,6 +738,9 @@ with settings_col_2:
 manual_codes = extract_codes_from_text(manual_codes_text)
 all_codes = dedupe_preserve_order(manual_codes + excel_codes)
 
+philips_count = len([code for code in all_codes if get_product_type(code) == "philips"])
+zambelis_count = len([code for code in all_codes if get_product_type(code) == "zambelis"])
+unknown_count = len([code for code in all_codes if get_product_type(code) == "unknown"])
 
 
 st.markdown("### Summary before download")
@@ -612,6 +755,18 @@ with metric_2:
 
 with metric_3:
     st.metric("Unique total", len(all_codes))
+
+
+brand_metric_1, brand_metric_2, brand_metric_3 = st.columns(3)
+
+with brand_metric_1:
+    st.metric("Philips codes", philips_count)
+
+with brand_metric_2:
+    st.metric("Zambelis codes", zambelis_count)
+
+with brand_metric_3:
+    st.metric("Unknown prefix", unknown_count)
 
 
 if all_codes:
@@ -633,36 +788,47 @@ download_button = st.button(
 if download_button:
     start_time = time.time()
 
-    st.info("Downloading Philips / Signify datasheets...")
+    st.info("Downloading datasheets...")
 
     results_by_code = {}
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {
             executor.submit(download_datasheet, code): code
             for code in all_codes
         }
-    
+
         completed = 0
-    
+
         for future in as_completed(future_map):
             code = future_map[future]
-            result = future.result()
-    
+
+            try:
+                result = future.result()
+            except Exception as e:
+                result = {
+                    "code": code,
+                    "brand": "Unknown",
+                    "success": False,
+                    "url": "",
+                    "error": str(e),
+                    "content": None,
+                }
+
             results_by_code[code] = result
-    
+
             completed += 1
             progress_bar.progress(completed / len(all_codes))
             status_text.write(f"Processed {completed} / {len(all_codes)}")
-    
+
     # Rebuild results in the same order as the original input
     results = [
         results_by_code[code]
         for code in all_codes
         if code in results_by_code
-        ]
+    ]
 
     successful = [item for item in results if item["success"]]
     failed = [item for item in results if not item["success"]]
@@ -687,6 +853,7 @@ if download_button:
             [
                 {
                     "Code": item["code"],
+                    "Brand": item.get("brand", ""),
                     "URL": item["url"],
                     "Error": item["error"],
                 }
