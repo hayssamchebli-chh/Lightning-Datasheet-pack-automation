@@ -349,31 +349,44 @@ st.set_page_config(
 
 
 # ============================================================
-# Philips-Style CSS
+# Philips + Zambelis Professional CSS
 # ============================================================
 
 st.markdown(
     """
     <style>
         :root {
-            --philips-blue: #0b5ed7;
-            --philips-deep-blue: #003b79;
-            --philips-light-blue: #eaf3ff;
-            --philips-bg: #f7f9fc;
-            --philips-card: #ffffff;
-            --philips-text: #102033;
-            --philips-muted: #64748b;
-            --philips-border: #dbe7f5;
-            --success-green: #0f9f6e;
-            --warning-orange: #f59e0b;
-            --danger-red: #dc2626;
+            /* Philips */
+            --philips-blue: #035ED8;
+            --philips-bright-blue: #0B5ED7;
+            --philips-deep-blue: #003B79;
+            --philips-light-blue: #EAF3FF;
+
+            /* Zambelis inspired premium lighting palette */
+            --zambelis-black: #111111;
+            --zambelis-charcoal: #252525;
+            --zambelis-warm-gray: #6F6A62;
+            --zambelis-gold: #C8A45D;
+            --zambelis-soft-gold: #F4E8CC;
+            --zambelis-cream: #FAF7F0;
+
+            /* Shared UI */
+            --app-bg: #F6F8FB;
+            --card-bg: #FFFFFF;
+            --text-main: #102033;
+            --text-muted: #64748B;
+            --border-soft: #DDE6F0;
+            --success-green: #0F9F6E;
+            --warning-orange: #F59E0B;
+            --danger-red: #DC2626;
         }
 
         .stApp {
             background:
-                radial-gradient(circle at top left, rgba(11, 94, 215, 0.10), transparent 32%),
-                linear-gradient(180deg, #ffffff 0%, var(--philips-bg) 45%, #eef4fb 100%);
-            color: var(--philips-text);
+                radial-gradient(circle at top left, rgba(3, 94, 216, 0.13), transparent 30%),
+                radial-gradient(circle at top right, rgba(200, 164, 93, 0.16), transparent 28%),
+                linear-gradient(180deg, #ffffff 0%, var(--app-bg) 46%, var(--zambelis-cream) 100%);
+            color: var(--text-main);
         }
 
         .block-container {
@@ -382,11 +395,19 @@ st.markdown(
             max-width: 1180px;
         }
 
-        .philips-topbar {
+        .brand-topbar {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 22px;
+            gap: 18px;
+        }
+
+        .brand-logos {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
         }
 
         .philips-logo {
@@ -399,17 +420,42 @@ st.markdown(
             font-size: 22px;
             letter-spacing: 1.5px;
             line-height: 1;
-            box-shadow: 0 8px 20px rgba(0, 59, 121, 0.08);
+            box-shadow: 0 8px 20px rgba(0, 59, 121, 0.10);
         }
 
-        .philips-badge {
-            color: var(--philips-deep-blue);
-            background: var(--philips-light-blue);
-            border: 1px solid var(--philips-border);
+        .brand-divider {
+            width: 1px;
+            height: 32px;
+            background: linear-gradient(
+                180deg,
+                transparent,
+                rgba(37, 37, 37, 0.35),
+                transparent
+            );
+        }
+
+        .zambelis-logo {
+            background: var(--zambelis-black);
+            color: var(--zambelis-gold);
+            border: 1px solid rgba(200, 164, 93, 0.65);
+            border-radius: 999px;
+            padding: 9px 18px;
+            font-weight: 700;
+            font-size: 18px;
+            letter-spacing: 2px;
+            line-height: 1;
+            box-shadow: 0 8px 22px rgba(17, 17, 17, 0.16);
+        }
+
+        .brand-badge {
+            color: var(--zambelis-charcoal);
+            background: linear-gradient(135deg, var(--philips-light-blue), var(--zambelis-soft-gold));
+            border: 1px solid var(--border-soft);
             padding: 8px 14px;
             border-radius: 999px;
             font-size: 13px;
-            font-weight: 600;
+            font-weight: 700;
+            box-shadow: 0 8px 18px rgba(15, 23, 42, 0.06);
         }
 
         .hero {
@@ -418,10 +464,18 @@ st.markdown(
             padding: 34px;
             border-radius: 30px;
             background:
-                linear-gradient(135deg, #003b79 0%, #0b5ed7 55%, #47a3ff 100%);
+                linear-gradient(
+                    135deg,
+                    var(--philips-deep-blue) 0%,
+                    var(--philips-blue) 44%,
+                    var(--zambelis-charcoal) 72%,
+                    var(--zambelis-black) 100%
+                );
             color: white;
             margin-bottom: 28px;
-            box-shadow: 0 24px 50px rgba(0, 59, 121, 0.24);
+            box-shadow:
+                0 24px 50px rgba(0, 59, 121, 0.22),
+                0 12px 30px rgba(17, 17, 17, 0.18);
         }
 
         .hero::after {
@@ -431,7 +485,7 @@ st.markdown(
             top: -90px;
             width: 260px;
             height: 260px;
-            background: rgba(255, 255, 255, 0.16);
+            background: rgba(200, 164, 93, 0.22);
             border-radius: 50%;
         }
 
@@ -449,15 +503,15 @@ st.markdown(
         .hero-content {
             position: relative;
             z-index: 2;
-            max-width: 760px;
+            max-width: 780px;
         }
 
         .hero-kicker {
             text-transform: uppercase;
-            letter-spacing: 1.7px;
+            letter-spacing: 1.9px;
             font-size: 12px;
-            font-weight: 700;
-            opacity: 0.86;
+            font-weight: 800;
+            color: var(--zambelis-soft-gold);
             margin-bottom: 10px;
         }
 
@@ -465,19 +519,19 @@ st.markdown(
             margin: 0 0 12px 0;
             font-size: 42px;
             line-height: 1.08;
-            font-weight: 800;
+            font-weight: 850;
         }
 
         .hero p {
             margin: 0;
             font-size: 17px;
             line-height: 1.6;
-            opacity: 0.92;
+            opacity: 0.94;
         }
 
         .tool-card {
-            background: rgba(255, 255, 255, 0.88);
-            border: 1px solid var(--philips-border);
+            background: rgba(255, 255, 255, 0.90);
+            border: 1px solid var(--border-soft);
             border-radius: 24px;
             padding: 22px;
             box-shadow: 0 16px 40px rgba(15, 23, 42, 0.07);
@@ -487,107 +541,132 @@ st.markdown(
 
         .section-title {
             font-size: 19px;
-            font-weight: 800;
+            font-weight: 850;
             color: var(--philips-deep-blue);
             margin-bottom: 6px;
         }
 
         .section-subtitle {
-            color: var(--philips-muted);
+            color: var(--text-muted);
             font-size: 14px;
             margin-bottom: 14px;
         }
 
         .info-strip {
             background: #ffffff;
-            border: 1px solid var(--philips-border);
+            border: 1px solid var(--border-soft);
+            border-left: 5px solid var(--zambelis-gold);
             border-radius: 20px;
             padding: 16px 18px;
             margin: 18px 0;
-            color: var(--philips-muted);
+            color: var(--text-muted);
             box-shadow: 0 10px 28px rgba(15, 23, 42, 0.05);
         }
 
         div[data-testid="stMetric"] {
             background: white;
-            border: 1px solid var(--philips-border);
+            border: 1px solid var(--border-soft);
             border-radius: 22px;
             padding: 18px;
             box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
         }
 
         div[data-testid="stMetric"] label {
-            color: var(--philips-muted) !important;
-            font-weight: 600;
+            color: var(--text-muted) !important;
+            font-weight: 650;
         }
 
         div[data-testid="stMetricValue"] {
             color: var(--philips-deep-blue);
-            font-weight: 800;
+            font-weight: 850;
         }
 
         .stTextArea textarea,
         .stTextInput input {
             border-radius: 16px !important;
-            border-color: var(--philips-border) !important;
+            border-color: var(--border-soft) !important;
+        }
+
+        .stTextArea textarea:focus,
+        .stTextInput input:focus {
+            border-color: var(--philips-blue) !important;
+            box-shadow: 0 0 0 1px var(--philips-blue) !important;
         }
 
         .stSelectbox div[data-baseweb="select"] {
             border-radius: 16px !important;
-            border-color: var(--philips-border) !important;
+            border-color: var(--border-soft) !important;
         }
 
         .stFileUploader {
-            background: rgba(255, 255, 255, 0.65);
+            background: rgba(255, 255, 255, 0.70);
             border-radius: 18px;
         }
 
         .stButton > button {
-            background: linear-gradient(135deg, var(--philips-blue), var(--philips-deep-blue));
+            background:
+                linear-gradient(
+                    135deg,
+                    var(--philips-blue) 0%,
+                    var(--philips-deep-blue) 55%,
+                    var(--zambelis-black) 100%
+                );
             color: white;
             border: 0;
             border-radius: 999px;
             padding: 13px 28px;
-            font-weight: 800;
-            box-shadow: 0 14px 28px rgba(11, 94, 215, 0.28);
+            font-weight: 850;
+            box-shadow:
+                0 14px 28px rgba(3, 94, 216, 0.28),
+                0 8px 18px rgba(17, 17, 17, 0.15);
             transition: all 0.2s ease;
         }
 
         .stButton > button:hover {
             transform: translateY(-1px);
-            box-shadow: 0 18px 34px rgba(11, 94, 215, 0.32);
+            box-shadow:
+                0 18px 34px rgba(3, 94, 216, 0.32),
+                0 10px 22px rgba(17, 17, 17, 0.18);
             color: white;
         }
 
         .stDownloadButton > button {
             background: #ffffff;
-            color: var(--philips-blue);
-            border: 1px solid var(--philips-blue);
+            color: var(--zambelis-black);
+            border: 1px solid var(--zambelis-gold);
             border-radius: 999px;
             padding: 13px 28px;
-            font-weight: 800;
+            font-weight: 850;
         }
 
         .stDownloadButton > button:hover {
-            background: var(--philips-light-blue);
-            color: var(--philips-deep-blue);
-            border: 1px solid var(--philips-deep-blue);
+            background: var(--zambelis-soft-gold);
+            color: var(--zambelis-black);
+            border: 1px solid var(--zambelis-gold);
         }
 
         .small-note {
-            color: var(--philips-muted);
+            color: var(--text-muted);
             font-size: 13px;
         }
 
         hr {
-            border-color: var(--philips-border);
+            border-color: var(--border-soft);
         }
 
         @media screen and (max-width: 768px) {
-            .philips-topbar {
+            .brand-topbar {
                 flex-direction: column;
                 align-items: flex-start;
                 gap: 12px;
+            }
+
+            .brand-logos {
+                gap: 10px;
+            }
+
+            .brand-divider {
+                display: none;
             }
 
             .hero {
@@ -607,7 +686,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
 # ============================================================
 # Header
