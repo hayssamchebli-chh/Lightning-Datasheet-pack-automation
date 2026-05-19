@@ -64,7 +64,7 @@ def get_product_type(code: str) -> str:
 def strip_product_prefix(code: str) -> str:
     """
     Remove PHL or ZMB prefix before searching vendor websites.
-    Also removes optional separators after the prefix.
+    Keeps spaces inside the actual product code.
     """
     if code.startswith("PHL"):
         cleaned = code[3:]
