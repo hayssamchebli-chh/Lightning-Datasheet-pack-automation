@@ -95,7 +95,7 @@ def extract_codes_from_text(text: str) -> list[str]:
     if not text:
         return []
 
-    raw_items = re.split(r"[\n,;\t ]+", text)
+    raw_items = re.split(r"[\n,;\t]+", text)
     codes = []
 
     for item in raw_items:
