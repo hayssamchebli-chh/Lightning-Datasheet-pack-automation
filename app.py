@@ -32,30 +32,21 @@ MAX_WORKERS = 8
 
 def normalize_code(value: str) -> str:
     """
-    Clean product code.
+    Clean product code without removing spaces inside the code.
 
     Expected prefixes:
     PHL = Philips / Signify product
     ZMB = Zambelis product
-
-    Examples:
-    PHL-046677590543 -> PHL046677590543
-    PHL 046677590543 -> PHL046677590543
-    ZMB-12345 -> ZMB12345
     """
     if value is None:
         return ""
 
     value = str(value).strip()
 
-    # Remove spaces, commas, semicolons, tabs
-    value = re.sub(r"[\s,;]+", "", value)
-
-    # Keep only letters, numbers, dash, underscore, and dot temporarily
-    value = re.sub(r"[^A-Za-z0-9\-_\.]", "", value)
+    # Keep letters, numbers, spaces, dash, underscore, and dot
+    value = re.sub(r"[^A-Za-z0-9 \-_\.]", "", value)
 
     return value.upper()
-
 
 def get_product_type(code: str) -> str:
     """
@@ -90,7 +81,8 @@ def strip_product_prefix(code: str) -> str:
 def extract_codes_from_text(text: str) -> list[str]:
     """
     Extract product codes from manual text input.
-    Supports newline, space, comma, semicolon, and tab separators.
+    Supports newline, comma, semicolon, and tab separators.
+    Spaces are kept inside product codes.
     """
     if not text:
         return []
