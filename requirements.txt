@@ -2,5 +2,5 @@ streamlit
 pandas
 requests
 pypdf
-playwright
 openpyxl
+playwright==1.41.2
