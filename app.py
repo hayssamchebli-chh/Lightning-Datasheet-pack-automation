@@ -9,12 +9,16 @@ import requests
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
 
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
 
 # ============================================================
 # Configuration
 # ============================================================
-
-PHILIPS_BASE_URL = "https://www.assets.signify.com/is/content/Signify/US.en_US.{code}"
 
 ZAMBELIS_URL_PATTERNS = [
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet_{code}.pdf",
@@ -154,66 +158,226 @@ def validate_pdf_content(content: bytes):
 
 def download_philips_datasheet(code: str) -> dict:
     """
-    Download one Philips / Signify datasheet.
-    The user enters code starting with PHL.
-    The PHL prefix is removed before searching Signify.
+    Download one Philips / Signify product leaflet using headless browser automation.
+
+    Steps:
+      1. Open signify.com and accept cookie consent.
+      2. Search for the product code.
+      3. Navigate to the first /prof/ product page (never raw asset links).
+      4. Open the Downloads tab if present.
+      5. Collect all candidate download links (PDF extension not required).
+      6. Try each candidate URL and return the first valid PDF.
     """
-    search_code = strip_product_prefix(code)
-    url = PHILIPS_BASE_URL.format(code=search_code)
-
-    try:
-        response = requests.get(
-            url,
-            timeout=DEFAULT_TIMEOUT,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/pdf,*/*",
-            },
-        )
-
-        content_type = response.headers.get("Content-Type", "").lower()
-        content = response.content or b""
-
-        if response.status_code != 200:
-            return {
-                "code": code,
-                "brand": "Philips",
-                "success": False,
-                "url": url,
-                "error": f"HTTP {response.status_code}",
-                "content": None,
-            }
-
-        if "application/pdf" not in content_type and not is_pdf_bytes(content):
-            return {
-                "code": code,
-                "brand": "Philips",
-                "success": False,
-                "url": url,
-                "error": f"Not a PDF. Content-Type: {content_type}",
-                "content": None,
-            }
-
-        validate_pdf_content(content)
-
-        return {
-            "code": code,
-            "brand": "Philips",
-            "success": True,
-            "url": url,
-            "error": "",
-            "content": content,
-        }
-
-    except Exception as e:
+    if not _PLAYWRIGHT_AVAILABLE:
         return {
             "code": code,
             "brand": "Philips",
             "success": False,
-            "url": url,
-            "error": str(e),
+            "url": "",
+            "error": (
+                "Playwright is not installed. "
+                "Run: pip install playwright && playwright install chromium"
+            ),
             "content": None,
         }
+
+    search_code = strip_product_prefix(code)
+    search_url = f"https://www.signify.com/global/en/search#q={search_code}&t=All"
+    product_url = ""
+
+    with _sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        page = context.new_page()
+
+        try:
+            # ── Step 1: load the site and dismiss the cookie banner ──────────
+            page.goto(
+                "https://www.signify.com/global/en",
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            for accept_sel in [
+                "#onetrust-accept-btn-handler",
+                'button:has-text("Accept all")',
+                'button:has-text("Accept All")',
+                'button:has-text("Accept")',
+            ]:
+                try:
+                    page.click(accept_sel, timeout=4_000)
+                    break
+                except Exception:
+                    pass
+
+            # ── Step 2: navigate to search results ───────────────────────────
+            page.goto(search_url, wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(4_000)  # let JS render the results
+
+            # ── Step 3: find the first /prof/ product page link ──────────────
+            # Deliberately exclude `a[href*="{search_code}"]` here — that
+            # selector is too broad and would catch raw asset/CDN links that
+            # are not product pages and that return 404 when fetched directly.
+            href = None
+            for sel in [
+                '[class*="search"] a[href*="/prof/"]',
+                '[class*="result"] a[href*="/prof/"]',
+                'a[href*="/global/prof/"]',
+                'a[href*="/prof/"]',
+            ]:
+                try:
+                    val = page.locator(sel).first.get_attribute("href", timeout=2_000)
+                    if val:
+                        href = val
+                        break
+                except Exception:
+                    pass
+
+            if not href:
+                return {
+                    "code": code,
+                    "brand": "Philips",
+                    "success": False,
+                    "url": search_url,
+                    "error": f"No product page found in Signify search for code: {search_code}",
+                    "content": None,
+                }
+
+            product_url = (
+                href if href.startswith("http") else f"https://www.signify.com{href}"
+            )
+
+            # ── Step 4: open the product page and click the Downloads tab ────
+            page.goto(product_url, wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(2_000)
+
+            for tab_sel in [
+                'button:has-text("Downloads")',
+                'a:has-text("Downloads")',
+                '[role="tab"]:has-text("Downloads")',
+            ]:
+                try:
+                    page.click(tab_sel, timeout=3_000)
+                    page.wait_for_timeout(1_500)
+                    break
+                except Exception:
+                    pass
+
+            # ── Step 5: collect all candidate download URLs ──────────────────
+            # PDF extension is NOT required: assets.signify.com (Scene7) and
+            # the lighting.philips.com API both serve PDFs without .pdf in
+            # the URL path.
+            candidate_urls: list[str] = []
+            for sel in [
+                'a[href*="product_leaflet"]',
+                'a:has-text("Product leaflet")',
+                'a:has-text("product leaflet")',
+                'a:has-text("Leaflet")',
+                'a[href*="leaflet"]',
+                'a[href*="assets.signify.com"]',
+                'a[href*="api/assets"]',
+                'a[href$=".pdf"]',
+            ]:
+                try:
+                    for link in page.locator(sel).all()[:3]:
+                        val = link.get_attribute("href", timeout=1_000)
+                        if val:
+                            full = (
+                                val if val.startswith("http")
+                                else f"https://www.signify.com{val}"
+                            )
+                            if full not in candidate_urls:
+                                candidate_urls.append(full)
+                except Exception:
+                    pass
+
+            if not candidate_urls:
+                return {
+                    "code": code,
+                    "brand": "Philips",
+                    "success": False,
+                    "url": product_url,
+                    "error": f"No download links found on product page: {product_url}",
+                    "content": None,
+                }
+
+            # ── Step 6: try each candidate URL; return first valid PDF ───────
+            # Use Playwright's own request context so the browser session cookies
+            # (set while visiting signify.com) are sent alongside each download
+            # request — assets.signify.com enforces CDN auth via those cookies.
+            # For assets.signify.com URLs we also try the EU.en_AA region prefix
+            # because the search page returns US.en_US links even for EU products.
+            last_error = ""
+            for try_url in candidate_urls:
+                attempts = [try_url]
+                if "assets.signify.com/is/content/" in try_url:
+                    for region in ("EU.en_AA", "global.en_AA"):
+                        variant = re.sub(
+                            r"(assets\.signify\.com/is/content/Signify/)[^.]+\.[^.]+\.",
+                            rf"\1{region}.",
+                            try_url,
+                        )
+                        if variant != try_url and variant not in attempts:
+                            attempts.append(variant)
+
+                for attempt_url in attempts:
+                    try:
+                        api_resp = context.request.get(
+                            attempt_url,
+                            headers={
+                                "Accept": "application/pdf,*/*",
+                                "Referer": product_url,
+                            },
+                            timeout=40_000,
+                        )
+                        content = api_resp.body() if api_resp.ok else b""
+                        if api_resp.ok and content and is_pdf_bytes(content):
+                            validate_pdf_content(content)
+                            return {
+                                "code": code,
+                                "brand": "Philips",
+                                "success": True,
+                                "url": attempt_url,
+                                "error": "",
+                                "content": content,
+                            }
+                        last_error = (
+                            f"HTTP {api_resp.status}"
+                            if not api_resp.ok
+                            else "Response is not a PDF"
+                        )
+                    except Exception as e:
+                        last_error = str(e)
+
+            return {
+                "code": code,
+                "brand": "Philips",
+                "success": False,
+                "url": candidate_urls[0],
+                "error": (
+                    f"Tried {len(candidate_urls)} URL(s) — none returned a valid PDF. "
+                    f"Last error: {last_error}"
+                ),
+                "content": None,
+            }
+
+        except Exception as e:
+            return {
+                "code": code,
+                "brand": "Philips",
+                "success": False,
+                "url": product_url or search_url,
+                "error": str(e),
+                "content": None,
+            }
+        finally:
+            browser.close()
 
 
 def download_zambelis_datasheet(code: str) -> dict:
