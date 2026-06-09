@@ -199,7 +199,7 @@ def download_philips_datasheet(code: str) -> dict:
         }
 
     search_code = strip_product_prefix(code)
-    search_url = f"https://www.signify.com/global/en/search#q={search_code}&t=All"
+    search_url = f"https://www.signify.com/global/search?query={search_code}"
     product_url = ""
 
     with _sync_playwright() as p:
