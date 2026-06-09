@@ -1,6 +1,14 @@
-import ioimport osimport reimport sysimport timeimport subprocessfrom concurrent.futures import ThreadPoolExecutor, as_completedfrom urllib.parse import quote, urljoin, urlparse
+import io
+import os
+import re
+import sys
+import time
+import subprocessfrom concurrent.futures import ThreadPoolExecutor, as_completedfrom urllib.parse 
+import quote, urljoin, urlparse
 
-import pandas as pdimport requestsimport streamlit as stfrom pypdf import PdfReader, PdfWriter
+import pandas as pd
+import requests
+import streamlit as stfrom pypdf import PdfReader, PdfWriter
 
 try:from playwright.sync_api import sync_playwright as _sync_playwright_PLAYWRIGHT_AVAILABLE = True
 
