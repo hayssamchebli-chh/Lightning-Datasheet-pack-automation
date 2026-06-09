@@ -11,7 +11,7 @@ import streamlit as st
 import os
 
 if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    os.system("playwright install chromium")
+    os.system("python -m playwright install chromium")
     
 from pypdf import PdfReader, PdfWriter
 
