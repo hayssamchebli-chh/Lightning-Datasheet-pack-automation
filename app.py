@@ -7,6 +7,12 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 import streamlit as st
+
+import os
+
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    os.system("playwright install chromium")
+    
 from pypdf import PdfReader, PdfWriter
 
 try:
