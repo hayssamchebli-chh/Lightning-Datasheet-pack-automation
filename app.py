@@ -1046,9 +1046,18 @@ if download_button:
             try:
                 result = future.result()
             except Exception as e:
+                product_type = get_product_type(code)
+
+                if product_type == "philips":
+                    brand = "Philips"
+                elif product_type == "zambelis":
+                    brand = "Zambelis"
+                else:
+                    brand = "Unknown"
+
                 result = {
                     "code": code,
-                    "brand": "Unknown",
+                    "brand": brand,
                     "success": False,
                     "url": "",
                     "error": str(e),
