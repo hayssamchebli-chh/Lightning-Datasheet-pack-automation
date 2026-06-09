@@ -242,6 +242,14 @@ def download_philips_datasheet(code: str) -> dict:
             # selector is too broad and would catch raw asset/CDN links that
             # are not product pages and that return 404 when fetched directly.
             href = None
+            
+            bad_paths = [
+                "/global/prof/indoor-luminaires",
+                "/global/prof/outdoor-luminaires",
+                "/global/prof/lamps",
+                "/global/prof",
+            ]
+            
             for sel in [
                 '[class*="search"] a[href*="/prof/"]',
                 '[class*="result"] a[href*="/prof/"]',
@@ -249,10 +257,30 @@ def download_philips_datasheet(code: str) -> dict:
                 'a[href*="/prof/"]',
             ]:
                 try:
-                    val = page.locator(sel).first.get_attribute("href", timeout=2_000)
-                    if val:
-                        href = val
+                    links = page.locator(sel).all()
+            
+                    for link in links:
+                        val = link.get_attribute("href", timeout=1_000)
+                        if not val:
+                            continue
+            
+                        full_url = val if val.startswith("http") else f"https://www.signify.com{val}"
+            
+                        # Skip generic category pages
+                        if any(full_url.rstrip("/") == f"https://www.signify.com{p}" for p in bad_paths):
+                            continue
+            
+                        # Prefer URLs that contain the searched product code
+                        compact_url = full_url.replace("-", "").replace("_", "").lower()
+                        compact_code = search_code.replace("-", "").replace("_", "").lower()
+            
+                        if compact_code in compact_url:
+                            href = val
+                            break
+            
+                    if href:
                         break
+            
                 except Exception:
                     pass
 
