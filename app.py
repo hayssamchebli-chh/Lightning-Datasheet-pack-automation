@@ -6,12 +6,12 @@ import time
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urljoin, urlparse
-from reportlab.pdfgen import canvas
 
 import pandas as pd
 import requests
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
 
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright
@@ -46,7 +46,7 @@ ZAMBELIS_URL_PATTERNS = [
 ]
 
 DEFAULT_TIMEOUT = (20, 40)  # connect timeout, read timeout
-
+MAX_WORKERS = 8
 
 
 # ============================================================
@@ -70,6 +70,7 @@ def normalize_code(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9 \-_\.]", "", value)
 
     return value.upper()
+
 
 def get_product_type(code: str) -> str:
     """
@@ -125,8 +126,8 @@ def extract_codes_from_excel(uploaded_file, selected_column: str) -> tuple[list[
     """
     Extract product codes from the selected Excel column.
 
-    If the Excel file has a column named Type or type, also map each code
-    to its type so it can be written on the datasheet PDF.
+    If the uploaded Excel file has a column named Type or type,
+    map each code to its corresponding type value.
     """
     df = pd.read_excel(uploaded_file)
 
@@ -161,7 +162,6 @@ def extract_codes_from_excel(uploaded_file, selected_column: str) -> tuple[list[
                     code_types[code] = type_text
 
     return codes, code_types
-
 
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -673,6 +673,7 @@ def download_philips_datasheet(code: str) -> dict:
         finally:
             browser.close()
 
+
 def download_zambelis_datasheet(code: str) -> dict:
     """
     Download one Zambelis datasheet.
@@ -765,6 +766,7 @@ def download_datasheet(code: str) -> dict:
         "content": None,
     }
 
+
 def add_type_label_to_page(page, type_text: str):
     """
     Write the code type in the top-left corner of a PDF page.
@@ -797,7 +799,7 @@ def merge_pdfs(downloads: list[dict]) -> bytes:
     """
     Merge all successful PDFs into one PDF.
     If a successful item has a type, write it only on the first page
-    of that datasheet.
+    of that individual datasheet PDF.
     """
     writer = PdfWriter()
 
@@ -809,7 +811,7 @@ def merge_pdfs(downloads: list[dict]) -> bytes:
         type_text = item.get("type", "")
 
         for page_index, page in enumerate(reader.pages):
-            if page_index == 0:
+            if page_index == 0 and type_text:
                 page = add_type_label_to_page(page, type_text)
 
             writer.add_page(page)
@@ -817,6 +819,8 @@ def merge_pdfs(downloads: list[dict]) -> bytes:
     output = io.BytesIO()
     writer.write(output)
     return output.getvalue()
+
+
 # ============================================================
 # Streamlit Page Setup
 # ============================================================
@@ -1390,7 +1394,6 @@ if download_button:
                     "content": None,
                 }
 
-            result["type"] = all_code_types.get(code, "")
             results_by_code[code] = result
 
             completed += 1
@@ -1398,8 +1401,12 @@ if download_button:
             status_text.write(f"Processed {completed} / {len(all_codes)}")
 
     # Rebuild results in the same order as the original input
+    # Type metadata is attached here, after downloads finish, so the download workflow stays unchanged.
     results = [
-        results_by_code[code]
+        {
+            **results_by_code[code],
+            "type": all_code_types.get(code, ""),
+        }
         for code in all_codes
         if code in results_by_code
     ]
