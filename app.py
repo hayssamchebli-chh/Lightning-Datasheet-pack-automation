@@ -241,18 +241,22 @@ def download_philips_datasheet(code: str) -> dict:
             # Deliberately exclude `a[href*="{search_code}"]` here — that
             # selector is too broad and would catch raw asset/CDN links that
             # are not product pages and that return 404 when fetched directly.
+    
             href = None
             
-            bad_paths = [
+            bad_keywords = [
                 "/global/prof/indoor-luminaires",
                 "/global/prof/outdoor-luminaires",
                 "/global/prof/lamps",
-                "/global/prof",
+                "/global/prof/products",
+                "/global/prof/support",
             ]
             
+            candidate_links = []
+            
             for sel in [
-                '[class*="search"] a[href*="/prof/"]',
-                '[class*="result"] a[href*="/prof/"]',
+                '[class*="search"] a[href]',
+                '[class*="result"] a[href]',
                 'a[href*="/global/prof/"]',
                 'a[href*="/prof/"]',
             ]:
@@ -261,42 +265,50 @@ def download_philips_datasheet(code: str) -> dict:
             
                     for link in links:
                         val = link.get_attribute("href", timeout=1_000)
+                        text = link.inner_text(timeout=1_000).strip()
+            
                         if not val:
                             continue
             
                         full_url = val if val.startswith("http") else f"https://www.signify.com{val}"
             
-                        # Skip generic category pages
-                        if any(full_url.rstrip("/") == f"https://www.signify.com{p}" for p in bad_paths):
+                        if "/prof/" not in full_url:
                             continue
             
-                        # Prefer URLs that contain the searched product code
-                        compact_url = full_url.replace("-", "").replace("_", "").lower()
-                        compact_code = search_code.replace("-", "").replace("_", "").lower()
+                        if any(bad in full_url for bad in bad_keywords):
+                            continue
             
-                        if compact_code in compact_url:
-                            href = val
-                            break
-            
-                    if href:
-                        break
+                        # Keep possible product links even if URL does not contain product code
+                        candidate_links.append((full_url, text))
             
                 except Exception:
                     pass
-
+            
+            # Prefer links where URL or text contains the searched code
+            compact_code = search_code.replace("-", "").replace("_", "").replace(" ", "").lower()
+            
+            for full_url, text in candidate_links:
+                compact_url = full_url.replace("-", "").replace("_", "").replace(" ", "").lower()
+                compact_text = text.replace("-", "").replace("_", "").replace(" ", "").lower()
+            
+                if compact_code in compact_url or compact_code in compact_text:
+                    href = full_url
+                    break
+            
+            # Fallback: use first non-category /prof/ link
+            if not href and candidate_links:
+                href = candidate_links[0][0]
+            
             if not href:
                 return {
                     "code": code,
                     "brand": "Philips",
                     "success": False,
                     "url": search_url,
-                    "error": f"No product page found in Signify search for code: {search_code}",
+                    "error": f"No Philips product page found for code: {search_code}",
                     "content": None,
                 }
-
-            product_url = (
-                href if href.startswith("http") else f"https://www.signify.com{href}"
-            )
+                product_url = href if href.startswith("http") else f"https://www.signify.com{href}"
 
             # ── Step 4: open the product page and click the Downloads tab ────
             page.goto(product_url, wait_until="domcontentloaded", timeout=45_000)
