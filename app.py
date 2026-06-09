@@ -1,26 +1,27 @@
 import io
 import re
 import time
+import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 import pandas as pd
 import requests
 import streamlit as st
-
-import os
-
-if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    os.system("python -m playwright install chromium")
-    
 from pypdf import PdfReader, PdfWriter
 
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright
     _PLAYWRIGHT_AVAILABLE = True
+
+    subprocess.run(
+        ["python", "-m", "playwright", "install", "chromium"],
+        check=False,
+    )
+
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
-
 
 # ============================================================
 # Configuration
