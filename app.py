@@ -46,7 +46,7 @@ ZAMBELIS_URL_PATTERNS = [
 ]
 
 DEFAULT_TIMEOUT = (20, 40)  # connect timeout, read timeout
-MAX_WORKERS = 8
+
 
 
 # ============================================================
