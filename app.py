@@ -6,6 +6,7 @@ import time
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urljoin, urlparse
+from reportlab.pdfgen import canvas
 
 import pandas as pd
 import requests
@@ -120,23 +121,47 @@ def extract_codes_from_text(text: str) -> list[str]:
     return codes
 
 
-def extract_codes_from_excel(uploaded_file, selected_column: str) -> list[str]:
+def extract_codes_from_excel(uploaded_file, selected_column: str) -> tuple[list[str], dict[str, str]]:
     """
     Extract product codes from the selected Excel column.
+
+    If the Excel file has a column named Type or type, also map each code
+    to its type so it can be written on the datasheet PDF.
     """
     df = pd.read_excel(uploaded_file)
 
     if selected_column not in df.columns:
-        return []
+        return [], {}
+
+    type_column = None
+
+    for column in df.columns:
+        if str(column).strip().lower() == "type":
+            type_column = column
+            break
 
     codes = []
+    code_types = {}
 
-    for value in df[selected_column].dropna():
-        code = normalize_code(value)
-        if code:
-            codes.append(code)
+    for _, row in df.iterrows():
+        code = normalize_code(row.get(selected_column))
 
-    return codes
+        if not code:
+            continue
+
+        codes.append(code)
+
+        if type_column is not None:
+            type_value = row.get(type_column)
+
+            if pd.notna(type_value):
+                type_text = str(type_value).strip()
+
+                if type_text:
+                    code_types[code] = type_text
+
+    return codes, code_types
+
 
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -740,10 +765,39 @@ def download_datasheet(code: str) -> dict:
         "content": None,
     }
 
+def add_type_label_to_page(page, type_text: str):
+    """
+    Write the code type in the top-left corner of a PDF page.
+    If type_text is empty, the page is left unchanged.
+    """
+    if not type_text:
+        return page
+
+    width = float(page.mediabox.width)
+    height = float(page.mediabox.height)
+
+    packet = io.BytesIO()
+
+    overlay_canvas = canvas.Canvas(packet, pagesize=(width, height))
+    overlay_canvas.setFont("Helvetica-Bold", 10)
+    overlay_canvas.drawString(20, height - 20, str(type_text))
+    overlay_canvas.save()
+
+    packet.seek(0)
+
+    overlay_pdf = PdfReader(packet)
+    overlay_page = overlay_pdf.pages[0]
+
+    page.merge_page(overlay_page)
+
+    return page
+
 
 def merge_pdfs(downloads: list[dict]) -> bytes:
     """
     Merge all successful PDFs into one PDF.
+    If a successful item has a type, write it only on the first page
+    of that datasheet.
     """
     writer = PdfWriter()
 
@@ -752,15 +806,17 @@ def merge_pdfs(downloads: list[dict]) -> bytes:
             continue
 
         reader = PdfReader(io.BytesIO(item["content"]))
+        type_text = item.get("type", "")
 
-        for page in reader.pages:
+        for page_index, page in enumerate(reader.pages):
+            if page_index == 0:
+                page = add_type_label_to_page(page, type_text)
+
             writer.add_page(page)
 
     output = io.BytesIO()
     writer.write(output)
     return output.getvalue()
-
-
 # ============================================================
 # Streamlit Page Setup
 # ============================================================
@@ -1189,6 +1245,7 @@ with right_col:
     )
 
     excel_codes = []
+    excel_code_types = {}
 
     if uploaded_file:
         df_preview = pd.read_excel(uploaded_file)
@@ -1201,7 +1258,7 @@ with right_col:
             options=list(df_preview.columns),
         )
 
-        excel_codes = extract_codes_from_excel(uploaded_file, selected_column)
+        excel_codes, excel_code_types = extract_codes_from_excel(uploaded_file, selected_column)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1243,6 +1300,7 @@ with settings_col_2:
 
 manual_codes = extract_codes_from_text(manual_codes_text)
 all_codes = dedupe_preserve_order(manual_codes + excel_codes)
+all_code_types = excel_code_types
 
 philips_count = len([code for code in all_codes if get_product_type(code) == "philips"])
 zambelis_count = len([code for code in all_codes if get_product_type(code) == "zambelis"])
@@ -1332,6 +1390,7 @@ if download_button:
                     "content": None,
                 }
 
+            result["type"] = all_code_types.get(code, "")
             results_by_code[code] = result
 
             completed += 1
