@@ -462,13 +462,19 @@ def download_datasheet(code: str) -> dict:
     Route product code to the correct vendor downloader.
     """
     product_type = get_product_type(code)
-    
-    result = {
+
+    if product_type == "philips":
+        return download_philips_datasheet(code)
+
+    if product_type == "zambelis":
+        return download_zambelis_datasheet(code)
+
+    return {
         "code": code,
-        "brand": "Philips" if product_type == "philips" else "Zambelis" if product_type == "zambelis" else "Unknown",
+        "brand": "Unknown",
         "success": False,
         "url": "",
-        "error": str(e),
+        "error": "Unknown code prefix. Code must start with PHL or ZMB.",
         "content": None,
     }
 
