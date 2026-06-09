@@ -5,7 +5,7 @@ import sys
 import time
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -36,6 +36,7 @@ except ImportError as e:
 # ============================================================
 # Configuration
 # ============================================================
+MAX_WORKERS = 2
 
 ZAMBELIS_URL_PATTERNS = [
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet_{code}.pdf",
@@ -175,15 +176,15 @@ def validate_pdf_content(content: bytes):
 
 def download_philips_datasheet(code: str) -> dict:
     """
-    Download one Philips / Signify product leaflet using headless browser automation.
+    Download one Philips / Signify product leaflet using Playwright.
 
-    Steps:
-      1. Open signify.com and accept cookie consent.
-      2. Search for the product code.
-      3. Navigate to the first /prof/ product page (never raw asset links).
-      4. Open the Downloads tab if present.
-      5. Collect all candidate download links (PDF extension not required).
-      6. Try each candidate URL and return the first valid PDF.
+    Improved workflow:
+      1. Open Signify and accept cookies.
+      2. Search for the stripped Philips code.
+      3. Collect multiple possible product pages.
+      4. Skip only exact generic category pages, not all indoor-luminaires pages.
+      5. Try each product page until a valid PDF leaflet is found.
+      6. Validate that the downloaded content is really a PDF.
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return {
@@ -192,18 +193,314 @@ def download_philips_datasheet(code: str) -> dict:
             "success": False,
             "url": "",
             "error": (
-                "Playwright is not installed. "
-                "Run: pip install playwright && playwright install chromium"
+                "Playwright is not installed or Chromium could not be installed."
             ),
             "content": None,
         }
 
     search_code = strip_product_prefix(code)
-    search_url = f"https://www.signify.com/global/search?query={search_code}"
+    encoded_code = quote(search_code, safe="")
+    compact_code = re.sub(r"[^a-z0-9]", "", search_code.lower())
+
+    search_urls = [
+        f"https://www.signify.com/global/en/search#q={encoded_code}&t=All",
+        f"https://www.signify.com/global/search?query={encoded_code}",
+    ]
+
+    home_url = "https://www.signify.com/global/en"
     product_url = ""
+    last_error = ""
+
+    def absolute_url(raw_url: str, base_url: str = "https://www.signify.com") -> str:
+        if not raw_url:
+            return ""
+
+        raw_url = raw_url.strip()
+
+        if raw_url.startswith("javascript:") or raw_url.startswith("mailto:") or raw_url.startswith("#"):
+            return ""
+
+        if raw_url.startswith("//"):
+            return "https:" + raw_url
+
+        if raw_url.startswith("http"):
+            return raw_url
+
+        return urljoin(base_url, raw_url)
+
+    def compact(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    def is_exact_generic_prof_page(url: str) -> bool:
+        """
+        Reject only exact category pages.
+        Do NOT reject every URL containing /indoor-luminaires,
+        because real product pages can be below that path.
+        """
+        path = urlparse(url).path.rstrip("/").lower()
+
+        exact_bad_paths = {
+            "/global/prof",
+            "/global/prof/indoor-luminaires",
+            "/global/prof/outdoor-luminaires",
+            "/global/prof/lamps",
+            "/global/prof/products",
+            "/global/prof/support",
+        }
+
+        return path in exact_bad_paths
+
+    def looks_like_product_page(url: str) -> bool:
+        if not url:
+            return False
+
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        host = parsed.netloc.lower()
+
+        if "signify.com" not in host:
+            return False
+
+        if "/prof/" not in path:
+            return False
+
+        if is_exact_generic_prof_page(url):
+            return False
+
+        # Product pages are usually deeper than /global/prof/indoor-luminaires
+        parts = [part for part in path.split("/") if part]
+        if len(parts) < 4:
+            return False
+
+        return True
+
+    def add_unique(items: list[str], value: str):
+        if value and value not in items:
+            items.append(value)
+
+    def collect_product_candidates(page) -> list[str]:
+        candidates = []
+
+        try:
+            links = page.locator("a[href]").all()
+        except Exception:
+            return []
+
+        for link in links[:500]:
+            try:
+                href = link.get_attribute("href", timeout=1_000)
+                text = link.inner_text(timeout=1_000).strip()
+            except Exception:
+                continue
+
+            full = absolute_url(href)
+
+            if not looks_like_product_page(full):
+                continue
+
+            score = 0
+            compact_url = compact(full)
+            compact_text = compact(text)
+
+            if compact_code and compact_code in compact_url:
+                score += 100
+
+            if compact_code and compact_code in compact_text:
+                score += 100
+
+            if "product" in compact_text:
+                score += 5
+
+            candidates.append((score, full))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        result = []
+        for _, url in candidates:
+            add_unique(result, url)
+
+        return result[:10]
+
+    def is_download_like(url: str) -> bool:
+        low = (url or "").lower()
+
+        return (
+            ".pdf" in low
+            or "product_leaflet" in low
+            or "product-leaflet" in low
+            or "leaflet" in low
+            or "datasheet" in low
+            or "data-sheet" in low
+            or "assets.signify.com" in low
+            or "/api/assets" in low
+            or "/is/content/signify" in low
+        )
+
+    def collect_urls_from_text(raw_text: str, base_url: str) -> list[str]:
+        urls = []
+
+        if not raw_text:
+            return urls
+
+        # Absolute URLs
+        for match in re.findall(r"https?://[^\"'<>\s)]+", raw_text):
+            add_unique(urls, match)
+
+        # Relative URLs that look like assets or PDFs
+        for match in re.findall(
+            r"/[^\"'<>\s)]*(?:product_leaflet|product-leaflet|leaflet|datasheet|data-sheet|api/assets|\.pdf)[^\"'<>\s)]*",
+            raw_text,
+            flags=re.IGNORECASE,
+        ):
+            add_unique(urls, urljoin(base_url, match))
+
+        return urls
+
+    def collect_download_candidates(page, base_url: str) -> list[str]:
+        candidates = []
+
+        # 1. Normal links
+        try:
+            links = page.locator("a[href]").all()
+            for link in links[:500]:
+                try:
+                    href = link.get_attribute("href", timeout=1_000)
+                    text = link.inner_text(timeout=1_000).strip()
+                except Exception:
+                    continue
+
+                full = absolute_url(href, base_url)
+
+                if is_download_like(full) or "leaflet" in text.lower() or "datasheet" in text.lower():
+                    add_unique(candidates, full)
+        except Exception:
+            pass
+
+        # 2. Data attributes and onclick values
+        for sel in ["button", "[data-href]", "[data-url]", "[data-download-url]"]:
+            try:
+                nodes = page.locator(sel).all()
+                for node in nodes[:300]:
+                    for attr in ["href", "data-href", "data-url", "data-download-url", "onclick"]:
+                        try:
+                            value = node.get_attribute(attr, timeout=500)
+                        except Exception:
+                            value = None
+
+                        if not value:
+                            continue
+
+                        for found in collect_urls_from_text(value, base_url):
+                            if is_download_like(found):
+                                add_unique(candidates, found)
+            except Exception:
+                pass
+
+        # 3. URLs hidden in page HTML / scripts
+        try:
+            html = page.content()
+            for found in collect_urls_from_text(html, base_url):
+                if is_download_like(found):
+                    add_unique(candidates, found)
+        except Exception:
+            pass
+
+        return candidates
+
+    def pdf_mentions_code(content: bytes) -> bool:
+        """
+        Optional safety check to avoid downloading the wrong product leaflet.
+        If text extraction fails, this returns False but does not crash.
+        """
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            text_parts = []
+
+            for page_index, pdf_page in enumerate(reader.pages[:3]):
+                text_parts.append(pdf_page.extract_text() or "")
+
+            pdf_text = compact("\n".join(text_parts))
+            return compact_code in pdf_text
+        except Exception:
+            return False
+
+    def try_pdf_urls(candidate_urls: list[str], referer: str, page_matches_code: bool):
+        last = "No candidate download URLs found."
+
+        for original_url in candidate_urls:
+            attempts = [original_url]
+
+            # Some Signify asset URLs include region/language prefixes.
+            # Try a few common variants.
+            if "assets.signify.com/is/content/" in original_url:
+                for region in ("EU.en_AA", "global.en_AA", "US.en_US"):
+                    variant = re.sub(
+                        r"(assets\.signify\.com/is/content/Signify/)[^.]+\.[^.]+\.",
+                        rf"\1{region}.",
+                        original_url,
+                    )
+                    if variant != original_url and variant not in attempts:
+                        attempts.append(variant)
+
+            for attempt_url in attempts:
+                try:
+                    response = context.request.get(
+                        attempt_url,
+                        headers={
+                            "Accept": "application/pdf,*/*",
+                            "Referer": referer,
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36"
+                            ),
+                        },
+                        timeout=40_000,
+                    )
+
+                    content = response.body() if response.ok else b""
+
+                    if not response.ok:
+                        last = f"HTTP {response.status} for {attempt_url}"
+                        continue
+
+                    if not content or not is_pdf_bytes(content):
+                        last = f"Response is not a PDF for {attempt_url}"
+                        continue
+
+                    validate_pdf_content(content)
+
+                    # Prefer PDFs that are clearly connected to the searched code.
+                    # If the page itself matched the code, accept the PDF.
+                    # If not, accept only if the PDF text mentions the code.
+                    if page_matches_code or pdf_mentions_code(content) or compact_code in compact(attempt_url):
+                        return {
+                            "code": code,
+                            "brand": "Philips",
+                            "success": True,
+                            "url": attempt_url,
+                            "error": "",
+                            "content": content,
+                        }, ""
+
+                    last = (
+                        "PDF was found, but the product code was not found "
+                        "in the page/PDF, so it was skipped to avoid wrong datasheet."
+                    )
+
+                except Exception as e:
+                    last = str(e)
+
+        return None, last
 
     with _sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -212,15 +509,13 @@ def download_philips_datasheet(code: str) -> dict:
             ),
             locale="en-US",
         )
+
         page = context.new_page()
 
         try:
-            # ── Step 1: load the site and dismiss the cookie banner ──────────
-            page.goto(
-                "https://www.signify.com/global/en",
-                wait_until="domcontentloaded",
-                timeout=30_000,
-            )
+            # Step 1: open Signify and accept cookies
+            page.goto(home_url, wait_until="domcontentloaded", timeout=30_000)
+
             for accept_sel in [
                 "#onetrust-accept-btn-handler",
                 'button:has-text("Accept all")',
@@ -233,192 +528,108 @@ def download_philips_datasheet(code: str) -> dict:
                 except Exception:
                     pass
 
-            # ── Step 2: navigate to search results ───────────────────────────
-            page.goto(search_url, wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(4_000)  # let JS render the results
+            product_candidates = []
 
-            # ── Step 3: find the first /prof/ product page link ──────────────
-            # Deliberately exclude `a[href*="{search_code}"]` here — that
-            # selector is too broad and would catch raw asset/CDN links that
-            # are not product pages and that return 404 when fetched directly.
-    
-            href = None
-            
-            bad_keywords = [
-                "/global/prof/indoor-luminaires",
-                "/global/prof/outdoor-luminaires",
-                "/global/prof/lamps",
-                "/global/prof/products",
-                "/global/prof/support",
-            ]
-            
-            candidate_links = []
-            
-            for sel in [
-                '[class*="search"] a[href]',
-                '[class*="result"] a[href]',
-                'a[href*="/global/prof/"]',
-                'a[href*="/prof/"]',
-            ]:
+            # Step 2: search Signify using both known search URL formats
+            for search_url in search_urls:
                 try:
-                    links = page.locator(sel).all()
-            
-                    for link in links:
-                        val = link.get_attribute("href", timeout=1_000)
-                        text = link.inner_text(timeout=1_000).strip()
-            
-                        if not val:
-                            continue
-            
-                        full_url = val if val.startswith("http") else f"https://www.signify.com{val}"
-            
-                        if "/prof/" not in full_url:
-                            continue
-            
-                        if any(bad in full_url for bad in bad_keywords):
-                            continue
-            
-                        # Keep possible product links even if URL does not contain product code
-                        candidate_links.append((full_url, text))
-            
-                except Exception:
-                    pass
-            
-            # Prefer links where URL or text contains the searched code
-            compact_code = search_code.replace("-", "").replace("_", "").replace(" ", "").lower()
-            
-            for full_url, text in candidate_links:
-                compact_url = full_url.replace("-", "").replace("_", "").replace(" ", "").lower()
-                compact_text = text.replace("-", "").replace("_", "").replace(" ", "").lower()
-            
-                if compact_code in compact_url or compact_code in compact_text:
-                    href = full_url
-                    break
-            
-            # Fallback: use first non-category /prof/ link
-            if not href and candidate_links:
-                href = candidate_links[0][0]
-            
-            if not href:
-                return {
-                    "code": code,
-                    "brand": "Philips",
-                    "success": False,
-                    "url": search_url,
-                    "error": f"No Philips product page found for code: {search_code}",
-                    "content": None,
-                }
-                product_url = href if href.startswith("http") else f"https://www.signify.com{href}"
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=45_000)
 
-            # ── Step 4: open the product page and click the Downloads tab ────
-            page.goto(product_url, wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(2_000)
-
-            for tab_sel in [
-                'button:has-text("Downloads")',
-                'a:has-text("Downloads")',
-                '[role="tab"]:has-text("Downloads")',
-            ]:
-                try:
-                    page.click(tab_sel, timeout=3_000)
-                    page.wait_for_timeout(1_500)
-                    break
-                except Exception:
-                    pass
-
-            # ── Step 5: collect all candidate download URLs ──────────────────
-            # PDF extension is NOT required: assets.signify.com (Scene7) and
-            # the lighting.philips.com API both serve PDFs without .pdf in
-            # the URL path.
-            candidate_urls: list[str] = []
-            for sel in [
-                'a[href*="product_leaflet"]',
-                'a:has-text("Product leaflet")',
-                'a:has-text("product leaflet")',
-                'a:has-text("Leaflet")',
-                'a[href*="leaflet"]',
-                'a[href*="assets.signify.com"]',
-                'a[href*="api/assets"]',
-                'a[href$=".pdf"]',
-            ]:
-                try:
-                    for link in page.locator(sel).all()[:3]:
-                        val = link.get_attribute("href", timeout=1_000)
-                        if val:
-                            full = (
-                                val if val.startswith("http")
-                                else f"https://www.signify.com{val}"
-                            )
-                            if full not in candidate_urls:
-                                candidate_urls.append(full)
-                except Exception:
-                    pass
-
-            if not candidate_urls:
-                return {
-                    "code": code,
-                    "brand": "Philips",
-                    "success": False,
-                    "url": product_url,
-                    "error": f"No download links found on product page: {product_url}",
-                    "content": None,
-                }
-
-            # ── Step 6: try each candidate URL; return first valid PDF ───────
-            # Use Playwright's own request context so the browser session cookies
-            # (set while visiting signify.com) are sent alongside each download
-            # request — assets.signify.com enforces CDN auth via those cookies.
-            # For assets.signify.com URLs we also try the EU.en_AA region prefix
-            # because the search page returns US.en_US links even for EU products.
-            last_error = ""
-            for try_url in candidate_urls:
-                attempts = [try_url]
-                if "assets.signify.com/is/content/" in try_url:
-                    for region in ("EU.en_AA", "global.en_AA"):
-                        variant = re.sub(
-                            r"(assets\.signify\.com/is/content/Signify/)[^.]+\.[^.]+\.",
-                            rf"\1{region}.",
-                            try_url,
-                        )
-                        if variant != try_url and variant not in attempts:
-                            attempts.append(variant)
-
-                for attempt_url in attempts:
                     try:
-                        api_resp = context.request.get(
-                            attempt_url,
-                            headers={
-                                "Accept": "application/pdf,*/*",
-                                "Referer": product_url,
-                            },
-                            timeout=40_000,
-                        )
-                        content = api_resp.body() if api_resp.ok else b""
-                        if api_resp.ok and content and is_pdf_bytes(content):
-                            validate_pdf_content(content)
-                            return {
-                                "code": code,
-                                "brand": "Philips",
-                                "success": True,
-                                "url": attempt_url,
-                                "error": "",
-                                "content": content,
-                            }
-                        last_error = (
-                            f"HTTP {api_resp.status}"
-                            if not api_resp.ok
-                            else "Response is not a PDF"
-                        )
-                    except Exception as e:
-                        last_error = str(e)
+                        page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception:
+                        pass
+
+                    page.wait_for_timeout(5_000)
+
+                    # Sometimes download/asset links appear directly in search HTML
+                    search_downloads = collect_download_candidates(page, search_url)
+                    result, last_error = try_pdf_urls(
+                        search_downloads,
+                        referer=search_url,
+                        page_matches_code=True,
+                    )
+
+                    if result:
+                        return result
+
+                    for candidate in collect_product_candidates(page):
+                        add_unique(product_candidates, candidate)
+
+                except Exception as e:
+                    last_error = str(e)
+
+            if not product_candidates:
+                return {
+                    "code": code,
+                    "brand": "Philips",
+                    "success": False,
+                    "url": " | ".join(search_urls),
+                    "error": (
+                        f"No Philips product page candidates found for code: {search_code}. "
+                        f"Last error: {last_error}"
+                    ),
+                    "content": None,
+                }
+
+            # Step 3: try each candidate product page
+            for product_url in product_candidates:
+                try:
+                    page.goto(product_url, wait_until="domcontentloaded", timeout=45_000)
+
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception:
+                        pass
+
+                    page.wait_for_timeout(2_000)
+
+                    page_text = ""
+                    try:
+                        page_text = page.inner_text("body", timeout=5_000)
+                    except Exception:
+                        pass
+
+                    page_matches_code = compact_code in compact(page_text)
+
+                    # Open Downloads tab/section if present
+                    for tab_sel in [
+                        'button:has-text("Downloads")',
+                        'a:has-text("Downloads")',
+                        '[role="tab"]:has-text("Downloads")',
+                        'button:has-text("Download")',
+                        'a:has-text("Download")',
+                    ]:
+                        try:
+                            page.click(tab_sel, timeout=3_000)
+                            page.wait_for_timeout(1_500)
+                            break
+                        except Exception:
+                            pass
+
+                    download_candidates = collect_download_candidates(page, product_url)
+
+                    result, last_error = try_pdf_urls(
+                        download_candidates,
+                        referer=product_url,
+                        page_matches_code=page_matches_code,
+                    )
+
+                    if result:
+                        return result
+
+                except Exception as e:
+                    last_error = str(e)
+                    continue
 
             return {
                 "code": code,
                 "brand": "Philips",
                 "success": False,
-                "url": candidate_urls[0],
+                "url": " | ".join(product_candidates[:5]),
                 "error": (
-                    f"Tried {len(candidate_urls)} URL(s) — none returned a valid PDF. "
+                    f"Tried {len(product_candidates)} Philips product page candidate(s), "
+                    f"but no valid matching datasheet PDF was found. "
                     f"Last error: {last_error}"
                 ),
                 "content": None,
@@ -429,13 +640,13 @@ def download_philips_datasheet(code: str) -> dict:
                 "code": code,
                 "brand": "Philips",
                 "success": False,
-                "url": product_url or search_url,
+                "url": product_url or " | ".join(search_urls),
                 "error": str(e),
                 "content": None,
             }
+
         finally:
             browser.close()
-
 
 def download_zambelis_datasheet(code: str) -> dict:
     """
