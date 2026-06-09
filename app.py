@@ -3,17 +3,23 @@ import os
 import re
 import sys
 import time
-import subprocessfrom concurrent.futures 
-import ThreadPoolExecutor, as_completedfrom urllib.parse 
-import quote, urljoin, urlparse
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote, urljoin, urlparse
 
 import pandas as pd
 import requests
-import streamlit as stfrom pypdf 
-import PdfReader, PdfWriter
+import streamlit as st
+from pypdf import PdfReader, PdfWriter
 
-try:from playwright.sync_api 
-    import sync_playwright as _sync_playwright_PLAYWRIGHT_AVAILABLE = True
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError as e:
+    _PLAYWRIGHT_AVAILABLE = False
+    st.error(f"Playwright is not installed: {e}")
+
+
 
 # Streamlit Cloud installs the Playwright Python package from requirements.txt,
 # but the Chromium browser may still need to be downloaded.
@@ -30,11 +36,9 @@ if install_result.returncode != 0:
 
 except ImportError as e:_PLAYWRIGHT_AVAILABLE = Falsest.error(f"Playwright is not installed: {e}")
 
-============================================================
-
-Configuration
-
-============================================================
+#============================================================
+#Configuration
+#============================================================
 
 MAX_WORKERS = 2
 
@@ -42,11 +46,9 @@ ZAMBELIS_URL_PATTERNS = ["https://www.zambelislights.gr/image/catalog/sopranos/p
 
 DEFAULT_TIMEOUT = (20, 40)  # connect timeout, read timeoutMAX_WORKERS = 8
 
-============================================================
-
-Helpers
-
-============================================================
+#============================================================
+#Helpers
+#============================================================
 
 def normalize_code(value: str) -> str:"""Clean product code without removing spaces inside the code.
 
@@ -693,19 +695,16 @@ output = io.BytesIO()
 writer.write(output)
 return output.getvalue()
 
-============================================================
-
-Streamlit Page Setup
-
-============================================================
+#============================================================
+#Streamlit Page Setup
+#============================================================
 
 st.set_page_config(page_title="Datasheet Pack Builder",page_icon="💡",layout="wide",)
 
-============================================================
 
-Philips + Zambelis Professional CSS
-
-============================================================
+#============================================================
+#Philips + Zambelis Professional CSS
+#============================================================
 
 st.markdown(""" {/* Philips */--philips-blue: #035ED8;--philips-bright-blue: #0B5ED7;--philips-deep-blue: #003B79;--philips-light-blue: #EAF3FF;
 
@@ -1035,11 +1034,9 @@ unsafe_allow_html=True,
 
 )
 
-============================================================
-
-Header
-
-============================================================
+#============================================================
+#Header
+#============================================================
 
 st.markdown("""PHILIPSZAMBELISPhilips & Zambelis Datasheet Automation
 
@@ -1059,11 +1056,9 @@ unsafe_allow_html=True,
 
 )
 
-============================================================
-
-Input Section
-
-============================================================
+#============================================================
+#Input Section
+#============================================================
 
 left_col, right_col = st.columns([1, 1], gap="large")
 
@@ -1103,11 +1098,9 @@ if uploaded_file:
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-============================================================
-
-Options Section
-
-============================================================
+#============================================================
+#Options Section
+#============================================================
 
 st.markdown("""Export settingsChoose the final PDF filename and how failed downloads should be handled.""",unsafe_allow_html=True,)
 
@@ -1117,11 +1110,9 @@ with settings_col_1:output_filename = st.text_input("Output PDF filename",value=
 
 with settings_col_2:skip_failed = st.checkbox("Skip failed codes and continue",value=True,)
 
-============================================================
-
-Code Summary
-
-============================================================
+#============================================================
+#Code Summary
+#============================================================
 
 manual_codes = extract_codes_from_text(manual_codes_text)all_codes = dedupe_preserve_order(manual_codes + excel_codes)
 
@@ -1147,11 +1138,9 @@ with brand_metric_3:st.metric("Unknown prefix", unknown_count)
 
 if all_codes:with st.expander("View detected codes"):st.write(all_codes)
 
-============================================================
-
-Download + Merge Action
-
-============================================================
+#============================================================
+#Download + Merge Action
+#============================================================
 
 download_button = st.button("Download and merge datasheets",type="primary",disabled=len(all_codes) == 0,)
 
