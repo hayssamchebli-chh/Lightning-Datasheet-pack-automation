@@ -1,2 +1,3 @@
 libglib2.0-0t64
 libnspr4
+libnss3
