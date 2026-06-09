@@ -3,4 +3,4 @@ pandas
 requests
 pypdf
 openpyxl
-playwright==1.41.2
+playwright
