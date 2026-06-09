@@ -1,7 +1,8 @@
 import io
-import re
-import time
 import os
+import re
+import sys
+import time
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
@@ -15,13 +16,22 @@ try:
     from playwright.sync_api import sync_playwright as _sync_playwright
     _PLAYWRIGHT_AVAILABLE = True
 
-    subprocess.run(
-        ["python", "-m", "playwright", "install", "chromium"],
-        check=False,
+    # Streamlit Cloud installs the Playwright Python package from requirements.txt,
+    # but the Chromium browser may still need to be downloaded.
+    install_result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True,
+        text=True,
     )
 
-except ImportError:
+    if install_result.returncode != 0:
+        _PLAYWRIGHT_AVAILABLE = False
+        st.error("Playwright Chromium install failed.")
+        st.code(install_result.stdout + "\n" + install_result.stderr)
+
+except ImportError as e:
     _PLAYWRIGHT_AVAILABLE = False
+    st.error(f"Playwright is not installed: {e}")
 
 # ============================================================
 # Configuration
