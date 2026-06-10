@@ -71,8 +71,8 @@ if not PLAYWRIGHT_READY:
 # Configuration
 # ============================================================
 
-MAX_WORKERS = 2
-DEFAULT_TIMEOUT = (20, 40)  # connect timeout, read timeout
+MAX_WORKERS = 4
+DEFAULT_TIMEOUT = (8, 15)  # connect timeout, read timeout
 
 ZAMBELIS_URL_PATTERNS = [
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet_{code}.pdf",
@@ -296,7 +296,7 @@ def download_philips_datasheet(code: str) -> dict:
         for _, url in candidates:
             add_unique(result, url)
 
-        return result[:10]
+        return result[:3]
 
     def is_download_like(url: str) -> bool:
         low = (url or "").lower()
@@ -394,7 +394,7 @@ def download_philips_datasheet(code: str) -> dict:
     def try_pdf_urls(candidate_urls: list[str], referer: str, page_matches_code: bool, context):
         last = "No candidate download URLs found."
 
-        for original_url in candidate_urls:
+        for original_url in candidate_urls[:6]:
             attempts = [original_url]
 
             if "assets.signify.com/is/content/" in original_url:
@@ -419,7 +419,7 @@ def download_philips_datasheet(code: str) -> dict:
                                 "AppleWebKit/537.36"
                             ),
                         },
-                        timeout=40_000,
+                        timeout=15_000,
                     )
 
                     content = response.body() if response.ok else b""
@@ -457,7 +457,7 @@ def download_philips_datasheet(code: str) -> dict:
     with _sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
 
         context = browser.new_context(
@@ -469,10 +469,20 @@ def download_philips_datasheet(code: str) -> dict:
             locale="en-US",
         )
 
+        try:
+            context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "font", "media"}
+                else route.continue_(),
+            )
+        except Exception:
+            pass
+
         page = context.new_page()
 
         try:
-            page.goto(home_url, wait_until="domcontentloaded", timeout=30_000)
+            page.goto(home_url, wait_until="domcontentloaded", timeout=15_000)
 
             for accept_sel in [
                 "#onetrust-accept-btn-handler",
@@ -481,7 +491,7 @@ def download_philips_datasheet(code: str) -> dict:
                 'button:has-text("Accept")',
             ]:
                 try:
-                    page.click(accept_sel, timeout=4_000)
+                    page.click(accept_sel, timeout=1_500)
                     break
                 except Exception:
                     pass
@@ -490,14 +500,14 @@ def download_philips_datasheet(code: str) -> dict:
 
             for search_url in search_urls:
                 try:
-                    page.goto(search_url, wait_until="domcontentloaded", timeout=45_000)
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=20_000)
 
                     try:
-                        page.wait_for_load_state("networkidle", timeout=15_000)
+                        page.wait_for_load_state("load", timeout=5_000)
                     except Exception:
                         pass
 
-                    page.wait_for_timeout(5_000)
+                    page.wait_for_timeout(1_000)
 
                     search_downloads = collect_download_candidates(page, search_url)
                     result, last_error = try_pdf_urls(
@@ -531,17 +541,17 @@ def download_philips_datasheet(code: str) -> dict:
 
             for product_url in product_candidates:
                 try:
-                    page.goto(product_url, wait_until="domcontentloaded", timeout=45_000)
+                    page.goto(product_url, wait_until="domcontentloaded", timeout=20_000)
 
                     try:
-                        page.wait_for_load_state("networkidle", timeout=15_000)
+                        page.wait_for_load_state("load", timeout=5_000)
                     except Exception:
                         pass
 
-                    page.wait_for_timeout(2_000)
+                    page.wait_for_timeout(750)
 
                     try:
-                        page_text = page.inner_text("body", timeout=5_000)
+                        page_text = page.inner_text("body", timeout=2_000)
                     except Exception:
                         page_text = ""
 
@@ -555,8 +565,8 @@ def download_philips_datasheet(code: str) -> dict:
                         'a:has-text("Download")',
                     ]:
                         try:
-                            page.click(tab_sel, timeout=3_000)
-                            page.wait_for_timeout(1_500)
+                            page.click(tab_sel, timeout=1_000)
+                            page.wait_for_timeout(500)
                             break
                         except Exception:
                             pass
@@ -582,7 +592,7 @@ def download_philips_datasheet(code: str) -> dict:
                 "success": False,
                 "url": " | ".join(product_candidates[:5]),
                 "error": (
-                    f"Tried {len(product_candidates)} Philips product page candidate(s), "
+                    f"Tried {len(product_candidates)} fastest Philips product page candidate(s), "
                     f"but no valid matching datasheet PDF was found. "
                     f"Last error: {last_error}"
                 ),
