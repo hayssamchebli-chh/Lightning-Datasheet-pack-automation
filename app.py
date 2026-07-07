@@ -1402,9 +1402,7 @@ st.markdown(
         <h1>Datasheet Pack Builder</h1>
         <p>
             Paste product codes, upload Excel lists, download official datasheets,
-            and merge everything into one clean PDF pack.
-            Use PHL for Philips products, ZMB for Zambelis products,
-            and product names for FUMAGALLI products.
+            and merge everything into one PDF pack.
         </p>
     </div>
 </div>
