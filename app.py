@@ -1741,23 +1741,24 @@ with right_col:
         label_visibility="collapsed",
     )
 
-    excel_items = []
-
-    if uploaded_file:
-        try:
-            uploaded_file.seek(0)
-            df_preview = pd.read_excel(uploaded_file)
-
-            st.caption("Excel preview")
-            st.dataframe(df_preview.head())
-
-            excel_items, excel_error = extract_items_from_excel(uploaded_file)
-            if excel_error:
-                st.error(excel_error)
-        except Exception as e:
-            st.error(f"Could not read Excel file: {e}")
-
     st.markdown("</div>", unsafe_allow_html=True)
+
+# Full-width Excel preview below the input row
+excel_items = []
+
+if uploaded_file:
+    try:
+        uploaded_file.seek(0)
+        df_preview = pd.read_excel(uploaded_file)
+
+        st.caption("Excel preview")
+        st.dataframe(df_preview.head(10), use_container_width=True)
+
+        excel_items, excel_error = extract_items_from_excel(uploaded_file)
+        if excel_error:
+            st.error(excel_error)
+    except Exception as e:
+        st.error(f"Could not read Excel file: {e}")
 
 # ============================================================
 # Options Section
