@@ -1,5 +1,5 @@
-import hashlib
 import io
+import os
 import re
 import sys
 import time
@@ -13,6 +13,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
+from reportlab.lib.colors import HexColor
+from reportlab.pdfgen import canvas as pdf_canvas
 
 # ============================================================
 # Streamlit Page Setup - must be the first Streamlit command
@@ -85,6 +87,19 @@ ZAMBELIS_URL_PATTERNS = [
 
 SIGNIFY_SEARCH_API_URL = "https://api.microservices.signify.com/api/product/v1/smc/en_AA/search"
 
+# Cover page inserted before each item's datasheet in the merged PDF
+COVER_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "item_type_template.pdf",
+)
+COVER_TEXT_COLOR = "#1F4EA1"  # same blue as the Harb Electric logo
+COVER_TEXT_X = 42  # left aligned with the logo
+COVER_TEXT_TOP_OFFSET = 170  # distance of the first line from the top of the page
+COVER_TEXT_MAX_WIDTH = 340  # keep the text inside the white area
+COVER_TEXT_FONT = "Helvetica-Bold"
+COVER_TEXT_FONT_SIZE = 34
+COVER_TEXT_MIN_FONT_SIZE = 18
+
 FUMAGALLI_DOWNLOADS_URL = "https://www.fumagalli.it/en/downloads/"
 FUMAGALLI_CATALOG_TTL = 3600  # refresh the cached product list every hour
 FUMAGALLI_MAX_PAGES = 6
@@ -151,21 +166,78 @@ def extract_codes_from_text(text: str) -> list[str]:
     return codes
 
 
-def extract_codes_from_excel(uploaded_file, selected_column: str) -> list[str]:
-    """Extract product codes from the selected Excel column."""
+def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
+    """Parse Type / Code / Description rows from the uploaded Excel file.
+
+    Expected columns (matched by name, falling back to column position):
+    1. Type        - written on the cover page before the item's datasheet
+    2. Code        - PHL/ZMB codes search by code; FUM codes use the Description
+    3. Description - FUMAGALLI product name / full description
+
+    Returns (items, error_message). Each item is a dict with:
+    kind ("code" or "fumagalli"), value (what to search), type, display.
+    """
     uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file)
 
-    if selected_column not in df.columns:
-        return []
+    if df.empty:
+        return [], "The Excel file has no rows."
 
-    codes = []
-    for value in df[selected_column].dropna():
-        code = normalize_code(value)
-        if code:
-            codes.append(code)
+    columns = list(df.columns)
 
-    return codes
+    def find_column(keyword: str, fallback_index: int):
+        for column in columns:
+            if keyword in str(column).strip().lower():
+                return column
+        if len(columns) > fallback_index:
+            return columns[fallback_index]
+        return None
+
+    type_col = find_column("type", 0)
+    code_col = find_column("code", 1)
+    desc_col = find_column("desc", 2)
+
+    if code_col is None:
+        return [], "Could not find a Code column in the Excel file."
+
+    def cell_text(row, column) -> str:
+        if column is None:
+            return ""
+        value = row.get(column)
+        if value is None or pd.isna(value):
+            return ""
+        return re.sub(r"\s+", " ", str(value)).strip()
+
+    items = []
+
+    for _, row in df.iterrows():
+        code = normalize_code(cell_text(row, code_col))
+        type_text = cell_text(row, type_col)
+        description = normalize_product_name(cell_text(row, desc_col))
+
+        if not code:
+            continue
+
+        if code.startswith("FUM"):
+            items.append(
+                {
+                    "kind": "fumagalli",
+                    "value": description,
+                    "type": type_text,
+                    "display": f"{code} - {description}" if description else code,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "kind": "code",
+                    "value": code,
+                    "type": type_text,
+                    "display": code,
+                }
+            )
+
+    return items, ""
 
 
 def normalize_product_name(value: str) -> str:
@@ -1060,6 +1132,19 @@ def download_fumagalli_datasheet(name: str) -> dict:
     """Download the Technical Details PDF for one FUMAGALLI name or description."""
     query = normalize_product_name(name)
 
+    if not query:
+        return {
+            "code": name,
+            "brand": "Fumagalli",
+            "success": False,
+            "url": "",
+            "error": (
+                "Empty FUMAGALLI product description. FUM items need the product "
+                "name or description in the Description column."
+            ),
+            "content": None,
+        }
+
     catalog = fetch_fumagalli_catalog()
 
     if catalog:
@@ -1136,40 +1221,110 @@ def download_datasheet(code: str) -> dict:
         "brand": "Unknown",
         "success": False,
         "url": "",
-        "error": "Unknown code prefix. Code must start with PHL or ZMB.",
+        "error": (
+            "Unknown code prefix. Codes must start with PHL or ZMB. "
+            "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
+        ),
         "content": None,
     }
 
 
-def merge_pdfs(downloads: list[dict]) -> tuple[bytes, int]:
-    """Merge all successful PDFs into one PDF, skipping duplicate files.
+def load_cover_template_bytes() -> bytes | None:
+    """Load the cover page template PDF shipped with the app."""
+    try:
+        with open(COVER_TEMPLATE_PATH, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
 
-    Different inputs can lead to the same datasheet (for example two color
-    variants of the same FUMAGALLI product). Identical PDF files are merged
-    only once. Returns (merged_pdf_bytes, number_of_duplicates_skipped).
+
+def build_type_overlay(type_text: str, page_width: float, page_height: float) -> bytes:
+    """Draw the item type in the blank space under the logo of the cover page."""
+    buffer = io.BytesIO()
+    overlay = pdf_canvas.Canvas(buffer, pagesize=(page_width, page_height))
+    overlay.setFillColor(HexColor(COVER_TEXT_COLOR))
+
+    def wrap_lines(font_size: int) -> list[str]:
+        lines = []
+        current = ""
+        for word in type_text.split():
+            candidate = f"{current} {word}".strip()
+            if overlay.stringWidth(candidate, COVER_TEXT_FONT, font_size) <= COVER_TEXT_MAX_WIDTH:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
+
+    font_size = COVER_TEXT_FONT_SIZE
+    lines = wrap_lines(font_size)
+
+    while font_size > COVER_TEXT_MIN_FONT_SIZE and (
+        len(lines) > 3
+        or any(
+            overlay.stringWidth(line, COVER_TEXT_FONT, font_size) > COVER_TEXT_MAX_WIDTH
+            for line in lines
+        )
+    ):
+        font_size -= 2
+        lines = wrap_lines(font_size)
+
+    overlay.setFont(COVER_TEXT_FONT, font_size)
+    y = page_height - COVER_TEXT_TOP_OFFSET
+
+    for line in lines:
+        overlay.drawString(COVER_TEXT_X, y, line)
+        y -= font_size * 1.3
+
+    overlay.save()
+    return buffer.getvalue()
+
+
+def build_cover_page(template_bytes: bytes, type_text: str):
+    """Return the cover template page, with the item type written on it."""
+    template_reader = PdfReader(io.BytesIO(template_bytes))
+    page = template_reader.pages[0]
+
+    if type_text:
+        overlay_bytes = build_type_overlay(
+            type_text,
+            float(page.mediabox.width),
+            float(page.mediabox.height),
+        )
+        overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
+        page.merge_page(overlay_reader.pages[0])
+
+    return page
+
+
+def merge_pdfs(items: list[dict], template_bytes: bytes | None) -> bytes:
+    """Merge every item's datasheet into one PDF.
+
+    Each successful item contributes a cover page (the template with the
+    item's Type written on it) followed by its datasheet. Items are kept in
+    order and duplicates are NOT removed: every item gets its own cover and
+    datasheet even when two items share the same datasheet file.
     """
     writer = PdfWriter()
-    seen_hashes = set()
-    duplicates_skipped = 0
 
-    for item in downloads:
-        if not item["success"]:
+    for item in items:
+        result = item["result"]
+        if not result["success"]:
             continue
 
-        digest = hashlib.md5(item["content"]).hexdigest()
-        if digest in seen_hashes:
-            duplicates_skipped += 1
-            continue
+        if template_bytes:
+            writer.add_page(build_cover_page(template_bytes, item.get("type", "")))
 
-        seen_hashes.add(digest)
-
-        reader = PdfReader(io.BytesIO(item["content"]))
+        reader = PdfReader(io.BytesIO(result["content"]))
         for page in reader.pages:
             writer.add_page(page)
 
     output = io.BytesIO()
     writer.write(output)
-    return output.getvalue(), duplicates_skipped
+    return output.getvalue()
 
 # ============================================================
 # Philips + Zambelis Professional CSS
@@ -1575,7 +1730,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Select the column that contains the product codes.</div>
+    <div class="section-subtitle">Columns: Type, Code, Description. FUM codes use the Description to find the FUMAGALLI datasheet. The Type is written on the cover page of each item.</div>
 """,
         unsafe_allow_html=True,
     )
@@ -1586,7 +1741,7 @@ with right_col:
         label_visibility="collapsed",
     )
 
-    excel_codes = []
+    excel_items = []
 
     if uploaded_file:
         try:
@@ -1596,12 +1751,9 @@ with right_col:
             st.caption("Excel preview")
             st.dataframe(df_preview.head(), use_container_width=True)
 
-            selected_column = st.selectbox(
-                "Choose product code column",
-                options=list(df_preview.columns),
-            )
-
-            excel_codes = extract_codes_from_excel(uploaded_file, selected_column)
+            excel_items, excel_error = extract_items_from_excel(uploaded_file)
+            if excel_error:
+                st.error(excel_error)
         except Exception as e:
             st.error(f"Could not read Excel file: {e}")
 
@@ -1640,13 +1792,23 @@ st.markdown("</div>", unsafe_allow_html=True)
 # Code Summary
 # ============================================================
 
-manual_codes = extract_codes_from_text(manual_codes_text)
-all_codes = dedupe_preserve_order(manual_codes + excel_codes)
+manual_codes = dedupe_preserve_order(extract_codes_from_text(manual_codes_text))
 fumagalli_names = dedupe_names_preserve_order(extract_names_from_text(fumagalli_names_text))
 
-philips_count = len([code for code in all_codes if get_product_type(code) == "philips"])
-zambelis_count = len([code for code in all_codes if get_product_type(code) == "zambelis"])
-unknown_count = len([code for code in all_codes if get_product_type(code) == "unknown"])
+all_items = (
+    [{"kind": "code", "value": code, "type": "", "display": code} for code in manual_codes]
+    + [{"kind": "fumagalli", "value": name, "type": "", "display": name} for name in fumagalli_names]
+    + excel_items
+)
+
+philips_count = len(
+    [i for i in all_items if i["kind"] == "code" and get_product_type(i["value"]) == "philips"]
+)
+zambelis_count = len(
+    [i for i in all_items if i["kind"] == "code" and get_product_type(i["value"]) == "zambelis"]
+)
+fumagalli_count = len([i for i in all_items if i["kind"] == "fumagalli"])
+unknown_count = len(all_items) - philips_count - zambelis_count - fumagalli_count
 
 st.markdown("### Summary before download")
 
@@ -1656,78 +1818,85 @@ with metric_1:
     st.metric("Manual codes", len(manual_codes))
 
 with metric_2:
-    st.metric("Excel codes", len(excel_codes))
-
-with metric_3:
     st.metric("FUMAGALLI names", len(fumagalli_names))
 
+with metric_3:
+    st.metric("Excel items", len(excel_items))
+
 with metric_4:
-    st.metric("Unique total", len(all_codes) + len(fumagalli_names))
+    st.metric("Total items", len(all_items))
 
 brand_metric_1, brand_metric_2, brand_metric_3, brand_metric_4 = st.columns(4)
 
 with brand_metric_1:
-    st.metric("Philips codes", philips_count)
+    st.metric("Philips", philips_count)
 
 with brand_metric_2:
-    st.metric("Zambelis codes", zambelis_count)
+    st.metric("Zambelis", zambelis_count)
 
 with brand_metric_3:
-    st.metric("FUMAGALLI names", len(fumagalli_names))
+    st.metric("FUMAGALLI", fumagalli_count)
 
 with brand_metric_4:
     st.metric("Unknown prefix", unknown_count)
 
-if all_codes or fumagalli_names:
+if all_items:
     with st.expander("View detected items"):
-        if all_codes:
-            st.write("Product codes:", all_codes)
+        fumagalli_items = [i for i in all_items if i["kind"] == "fumagalli"]
 
-        if fumagalli_names:
-            st.write("FUMAGALLI items:")
-
+        catalog_preview = []
+        if fumagalli_items:
             try:
                 catalog_preview = fetch_fumagalli_catalog()
             except Exception:
                 catalog_preview = []
 
-            if catalog_preview:
-                preview_rows = []
-                for fumagalli_name in fumagalli_names:
+        overview_rows = []
+        for item in all_items:
+            if item["kind"] == "fumagalli":
+                brand = "FUMAGALLI"
+                matched = ""
+                if catalog_preview:
                     matched_product, match_note = resolve_fumagalli_product(
-                        normalize_product_name(fumagalli_name),
+                        normalize_product_name(item["value"]),
                         catalog_preview,
                     )
-                    preview_rows.append(
-                        {
-                            "Input": fumagalli_name,
-                            "Matched product": matched_product["name"] if matched_product else "No match",
-                            "Note": "" if matched_product else match_note,
-                        }
-                    )
-
-                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+                    matched = matched_product["name"] if matched_product else f"No match ({match_note})"
             else:
-                st.write(fumagalli_names)
+                product_type = get_product_type(item["value"])
+                brand = product_type.capitalize() if product_type != "unknown" else "Unknown"
+                matched = ""
+
+            overview_rows.append(
+                {
+                    "Item": item["display"],
+                    "Brand": brand,
+                    "Type (cover page)": item.get("type", ""),
+                    "Matched FUMAGALLI product": matched,
+                }
+            )
+
+        st.dataframe(pd.DataFrame(overview_rows), use_container_width=True)
 
 # ============================================================
 # Download + Merge Action
 # ============================================================
 
-download_jobs = [("code", code) for code in all_codes] + [
-    ("fumagalli", name) for name in fumagalli_names
-]
-
 download_button = st.button(
     "Download and merge datasheets",
     type="primary",
-    disabled=len(download_jobs) == 0,
+    disabled=len(all_items) == 0,
 )
 
 if download_button:
     start_time = time.time()
 
     st.info("Downloading datasheets...")
+
+    # Download each unique (kind, value) once, then map results back to
+    # every item, so repeated codes/descriptions do not download twice but
+    # still each get their own cover page and datasheet in the merged PDF.
+    unique_jobs = list(dict.fromkeys((item["kind"], item["value"]) for item in all_items))
 
     results_by_job = {}
     progress_bar = st.progress(0)
@@ -1741,7 +1910,7 @@ if download_button:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {
             executor.submit(run_download_job, kind, value): (kind, value)
-            for kind, value in download_jobs
+            for kind, value in unique_jobs
         }
         completed = 0
 
@@ -1773,19 +1942,21 @@ if download_button:
 
             results_by_job[(kind, value)] = result
             completed += 1
-            progress_bar.progress(completed / len(download_jobs))
-            status_text.write(f"Processed {completed} / {len(download_jobs)}")
+            progress_bar.progress(completed / len(unique_jobs))
+            status_text.write(f"Processed {completed} / {len(unique_jobs)}")
 
-    results = [results_by_job[job] for job in download_jobs if job in results_by_job]
-    successful = [item for item in results if item["success"]]
-    failed = [item for item in results if not item["success"]]
+    for item in all_items:
+        item["result"] = results_by_job[(item["kind"], item["value"])]
+
+    successful = [item for item in all_items if item["result"]["success"]]
+    failed = [item for item in all_items if not item["result"]["success"]]
 
     st.divider()
 
     result_col_1, result_col_2, result_col_3 = st.columns(3)
 
     with result_col_1:
-        st.metric("Submitted", len(download_jobs))
+        st.metric("Submitted", len(all_items))
 
     with result_col_2:
         st.metric("Downloaded", len(successful))
@@ -1794,15 +1965,16 @@ if download_button:
         st.metric("Failed", len(failed))
 
     if failed:
-        st.warning("Some codes failed.")
+        st.warning("Some items failed.")
 
         failed_table = pd.DataFrame(
             [
                 {
-                    "Code / Name": item["code"],
-                    "Brand": item.get("brand", ""),
-                    "URL": item["url"],
-                    "Error": item["error"],
+                    "Item": item["display"],
+                    "Brand": item["result"].get("brand", ""),
+                    "Type": item.get("type", ""),
+                    "URL": item["result"]["url"],
+                    "Error": item["result"]["error"],
                 }
                 for item in failed
             ]
@@ -1819,19 +1991,20 @@ if download_button:
         st.stop()
 
     try:
-        merged_pdf, duplicates_skipped = merge_pdfs(successful)
+        cover_template_bytes = load_cover_template_bytes()
+        if cover_template_bytes is None:
+            st.warning(
+                "Cover page template (item_type_template.pdf) was not found. "
+                "Datasheets were merged without cover pages."
+            )
+
+        merged_pdf = merge_pdfs(successful, cover_template_bytes)
 
         if not output_filename.lower().endswith(".pdf"):
             output_filename += ".pdf"
 
         elapsed = round(time.time() - start_time, 2)
         st.success(f"PDF pack created successfully in {elapsed} seconds.")
-
-        if duplicates_skipped:
-            st.info(
-                f"{duplicates_skipped} item(s) shared the same datasheet as another item, "
-                f"so each datasheet was included only once."
-            )
 
         st.download_button(
             label="Download merged PDF",
