@@ -1402,7 +1402,7 @@ st.markdown(
         <h1>Datasheet Pack Builder</h1>
         <p>
             Paste product codes, upload Excel lists, download official datasheets,
-            and merge everything into one PDF pack.
+            and merge everything into one PDF.
         </p>
     </div>
 </div>
@@ -1440,7 +1440,7 @@ with middle_col:
         """
 <div class="tool-card">
     <div class="section-title">FUMAGALLI product names</div>
-    <div class="section-subtitle">FUMAGALLI items use names, not codes. Paste product names or full descriptions, one per line.</div>
+    <div class="section-subtitle">Paste FUMAGALLI product names or full descriptions, one per line.</div>
 """,
         unsafe_allow_html=True,
     )
