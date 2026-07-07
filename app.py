@@ -1,3 +1,4 @@
+import hashlib
 import io
 import re
 import sys
@@ -1039,13 +1040,27 @@ def download_datasheet(code: str) -> dict:
     }
 
 
-def merge_pdfs(downloads: list[dict]) -> bytes:
-    """Merge all successful PDFs into one PDF."""
+def merge_pdfs(downloads: list[dict]) -> tuple[bytes, int]:
+    """Merge all successful PDFs into one PDF, skipping duplicate files.
+
+    Different inputs can lead to the same datasheet (for example two color
+    variants of the same FUMAGALLI product). Identical PDF files are merged
+    only once. Returns (merged_pdf_bytes, number_of_duplicates_skipped).
+    """
     writer = PdfWriter()
+    seen_hashes = set()
+    duplicates_skipped = 0
 
     for item in downloads:
         if not item["success"]:
             continue
+
+        digest = hashlib.md5(item["content"]).hexdigest()
+        if digest in seen_hashes:
+            duplicates_skipped += 1
+            continue
+
+        seen_hashes.add(digest)
 
         reader = PdfReader(io.BytesIO(item["content"]))
         for page in reader.pages:
@@ -1053,7 +1068,7 @@ def merge_pdfs(downloads: list[dict]) -> bytes:
 
     output = io.BytesIO()
     writer.write(output)
-    return output.getvalue()
+    return output.getvalue(), duplicates_skipped
 
 # ============================================================
 # Philips + Zambelis Professional CSS
@@ -1703,13 +1718,19 @@ if download_button:
         st.stop()
 
     try:
-        merged_pdf = merge_pdfs(successful)
+        merged_pdf, duplicates_skipped = merge_pdfs(successful)
 
         if not output_filename.lower().endswith(".pdf"):
             output_filename += ".pdf"
 
         elapsed = round(time.time() - start_time, 2)
         st.success(f"PDF pack created successfully in {elapsed} seconds.")
+
+        if duplicates_skipped:
+            st.info(
+                f"{duplicates_skipped} item(s) shared the same datasheet as another item, "
+                f"so each datasheet was included only once."
+            )
 
         st.download_button(
             label="Download merged PDF",
