@@ -83,6 +83,8 @@ ZAMBELIS_URL_PATTERNS = [
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet%20...%20{code}.pdf",
 ]
 
+SIGNIFY_SEARCH_API_URL = "https://api.microservices.signify.com/api/product/v1/smc/en_AA/search"
+
 FUMAGALLI_DOWNLOADS_URL = "https://www.fumagalli.it/en/downloads/"
 FUMAGALLI_CATALOG_TTL = 3600  # refresh the cached product list every hour
 FUMAGALLI_MAX_PAGES = 6
@@ -235,8 +237,107 @@ def validate_pdf_content(content: bytes) -> None:
     PdfReader(io.BytesIO(content))
 
 
+def download_philips_datasheet_api(code: str) -> dict | None:
+    """Fast path: resolve a Philips code through the public Signify product API.
+
+    This is the same API the signify.com search page uses. It matches both
+    12NC order codes and EAN/UPC codes, and returns a direct product leaflet
+    PDF URL, so no browser is needed. Returns None when the code cannot be
+    resolved confidently, so the caller can fall back to the browser flow.
+    """
+    search_code = strip_product_prefix(code)
+    compact_code = re.sub(r"[^a-z0-9]", "", search_code.lower())
+
+    if not compact_code:
+        return None
+
+    try:
+        response = requests.get(
+            SIGNIFY_SEARCH_API_URL,
+            params={"query": search_code},
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+                "Origin": "https://www.signify.com",
+                "Referer": "https://www.signify.com/",
+            },
+        )
+
+        if response.status_code != 200:
+            return None
+
+        payload = response.json()
+    except Exception:
+        return None
+
+    def field(result: dict, key: str):
+        value = result.get(key)
+        if isinstance(value, dict):
+            return value.get("value")
+        return value
+
+    def compact(value) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+    matches = []
+    for result in payload.get("results") or []:
+        codes = field(result, "product_codes") or []
+        if isinstance(codes, str):
+            codes = [codes]
+
+        known_codes = {compact(c) for c in codes}
+        known_codes.add(compact(field(result, "sku")))
+
+        if compact_code in known_codes:
+            matches.append(result)
+
+    for result in matches:
+        leaflet_url = field(result, "leaflet") or ""
+        if not leaflet_url:
+            continue
+
+        try:
+            pdf_response = requests.get(
+                leaflet_url,
+                timeout=DEFAULT_TIMEOUT,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/pdf,*/*",
+                    "Referer": "https://www.signify.com/",
+                },
+            )
+
+            if pdf_response.status_code != 200:
+                continue
+
+            content = pdf_response.content or b""
+            validate_pdf_content(content)
+
+            return {
+                "code": code,
+                "brand": "Philips",
+                "success": True,
+                "url": leaflet_url,
+                "error": "",
+                "content": content,
+            }
+        except Exception:
+            continue
+
+    return None
+
+
 def download_philips_datasheet(code: str) -> dict:
-    """Download one Philips / Signify product leaflet using Playwright."""
+    """Download one Philips / Signify product leaflet.
+
+    Tries the fast Signify product API first; falls back to the original
+    Playwright browser flow when the API cannot resolve the code.
+    """
+    api_result = download_philips_datasheet_api(code)
+    if api_result is not None:
+        return api_result
+
     if not PLAYWRIGHT_READY or _sync_playwright is None:
         return {
             "code": code,
