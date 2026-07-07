@@ -1730,7 +1730,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Columns: Type, Code, Description. FUM codes use the Description.</div>
+    <div class="section-subtitle">Columns: Type, Code, and Description. FUMAGALLI codes use the Description.</div>
 """,
         unsafe_allow_html=True,
     )
