@@ -80,6 +80,8 @@ ZAMBELIS_URL_PATTERNS = [
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet%20...%20{code}.pdf",
 ]
 
+FUMAGALLI_DOWNLOADS_URL = "https://www.fumagalli.it/en/downloads/"
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -150,6 +152,46 @@ def extract_codes_from_excel(uploaded_file, selected_column: str) -> list[str]:
             codes.append(code)
 
     return codes
+
+
+def normalize_product_name(value: str) -> str:
+    """Clean a FUMAGALLI product name without changing its casing."""
+    if value is None:
+        return ""
+
+    value = str(value).strip()
+    value = re.sub(r"[^A-Za-z0-9 \-_\.&/]", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def extract_names_from_text(text: str) -> list[str]:
+    """Extract FUMAGALLI product names from manual text input."""
+    if not text:
+        return []
+
+    raw_items = re.split(r"[\n,;\t]+", text)
+    names = []
+
+    for item in raw_items:
+        name = normalize_product_name(item)
+        if name:
+            names.append(name)
+
+    return names
+
+
+def dedupe_names_preserve_order(items: list[str]) -> list[str]:
+    """Remove duplicate names case-insensitively, preserving first appearance."""
+    seen = set()
+    result = []
+
+    for item in items:
+        key = item.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+
+    return result
 
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -668,6 +710,148 @@ def download_zambelis_datasheet(code: str) -> dict:
     }
 
 
+def parse_fumagalli_products(html: str) -> list[dict]:
+    """Parse product entries from the Fumagalli downloads page.
+
+    Each product is a block like:
+    <div class="prodotto-download ...">
+        <h3><a href="...">Product Name</a></h3>
+        <div class="download-files ...">
+            <a href="....pdf" class="download-file">... Technical Details ...</a>
+            ...
+        </div>
+    </div>
+    """
+    products = []
+
+    for block in re.split(r'class="prodotto-download', html)[1:]:
+        name_match = re.search(r"<h3[^>]*>\s*<a[^>]*>([^<]+)</a>", block)
+        if not name_match:
+            continue
+
+        name = re.sub(r"\s+", " ", name_match.group(1)).strip()
+        technical_pdf = ""
+
+        for href, inner in re.findall(
+            r'<a\s+href="([^"]+)"\s+class="download-file"[^>]*>(.*?)</a>',
+            block,
+            flags=re.DOTALL,
+        ):
+            inner_text = re.sub(r"<[^>]+>", " ", inner)
+            if "technical" in inner_text.lower() and href.lower().endswith(".pdf"):
+                technical_pdf = href
+                break
+
+        products.append({"name": name, "technical_pdf": technical_pdf})
+
+    return products
+
+
+def search_fumagalli_products(query: str) -> tuple[list[dict], str]:
+    """Search the Fumagalli downloads page and return parsed product entries."""
+    try:
+        response = requests.post(
+            FUMAGALLI_DOWNLOADS_URL,
+            data={"search": query},
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "text/html,*/*",
+            },
+        )
+
+        if response.status_code != 200:
+            return [], f"HTTP {response.status_code} while searching Fumagalli downloads"
+
+        return parse_fumagalli_products(response.text), ""
+
+    except Exception as e:
+        return [], str(e)
+
+
+def download_fumagalli_datasheet(name: str) -> dict:
+    """Download the Technical Details PDF for one FUMAGALLI product name."""
+    query = normalize_product_name(name)
+    key = query.casefold()
+
+    products, last_error = search_fumagalli_products(query)
+
+    # If nothing came back for the full name, retry with the first word only.
+    if not products and " " in query:
+        products, last_error = search_fumagalli_products(query.split(" ")[0])
+
+    match = None
+    exact = [p for p in products if p["name"].casefold() == key]
+    prefix = [p for p in products if p["name"].casefold().startswith(key)]
+    contains = [p for p in products if key in p["name"].casefold()]
+
+    for group in (exact, prefix, contains):
+        with_pdf = [p for p in group if p["technical_pdf"]]
+        if with_pdf:
+            match = with_pdf[0]
+            break
+
+    if match is None:
+        if products:
+            found_names = ", ".join(p["name"] for p in products[:10])
+            error = (
+                f"No matching Fumagalli product with a Technical Details PDF "
+                f"was found for '{query}'. Products returned by the search: {found_names}"
+            )
+        else:
+            error = (
+                f"No Fumagalli products found for '{query}'. "
+                f"Last error: {last_error or 'empty search result'}"
+            )
+
+        return {
+            "code": name,
+            "brand": "Fumagalli",
+            "success": False,
+            "url": FUMAGALLI_DOWNLOADS_URL,
+            "error": error,
+            "content": None,
+        }
+
+    pdf_url = match["technical_pdf"]
+
+    try:
+        response = requests.get(
+            pdf_url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/pdf,*/*",
+                "Referer": FUMAGALLI_DOWNLOADS_URL,
+            },
+        )
+
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+
+        content = response.content or b""
+        validate_pdf_content(content)
+
+        return {
+            "code": name,
+            "brand": "Fumagalli",
+            "success": True,
+            "url": pdf_url,
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "code": name,
+            "brand": "Fumagalli",
+            "success": False,
+            "url": pdf_url,
+            "error": f"Matched product '{match['name']}' but the PDF download failed: {e}",
+            "content": None,
+        }
+
+
 def download_datasheet(code: str) -> dict:
     """Route product code to the correct vendor downloader."""
     product_type = get_product_type(code)
@@ -721,6 +905,7 @@ st.markdown(
         --zambelis-gold: #C8A45D;
         --zambelis-soft-gold: #F4E8CC;
         --zambelis-cream: #FAF7F0;
+        --fumagalli-green: #1E5B3A;
         --app-bg: #F6F8FB;
         --card-bg: #FFFFFF;
         --text-main: #102033;
@@ -790,6 +975,19 @@ st.markdown(
         letter-spacing: 2px;
         line-height: 1;
         box-shadow: 0 8px 22px rgba(17, 17, 17, 0.16);
+    }
+
+    .fumagalli-logo {
+        background: #ffffff;
+        color: var(--fumagalli-green);
+        border: 2px solid var(--fumagalli-green);
+        border-radius: 4px;
+        padding: 9px 15px;
+        font-weight: 800;
+        font-size: 18px;
+        letter-spacing: 2px;
+        line-height: 1;
+        box-shadow: 0 8px 20px rgba(30, 91, 58, 0.14);
     }
 
     .brand-badge {
@@ -1024,8 +1222,10 @@ st.markdown(
         <div class="philips-logo">PHILIPS</div>
         <div class="brand-divider"></div>
         <div class="zambelis-logo">ZAMBELIS</div>
+        <div class="brand-divider"></div>
+        <div class="fumagalli-logo">FUMAGALLI</div>
     </div>
-    <div class="brand-badge">Philips &amp; Zambelis Datasheet Automation</div>
+    <div class="brand-badge">Philips, Zambelis &amp; FUMAGALLI Datasheet Automation</div>
 </div>
 
 <div class="hero">
@@ -1035,7 +1235,8 @@ st.markdown(
         <p>
             Paste product codes, upload Excel lists, download official datasheets,
             and merge everything into one clean PDF pack.
-            Use PHL for Philips products and ZMB for Zambelis products.
+            Use PHL for Philips products, ZMB for Zambelis products,
+            and product names for FUMAGALLI products.
         </p>
     </div>
 </div>
@@ -1047,7 +1248,7 @@ st.markdown(
 # Input Section
 # ============================================================
 
-left_col, right_col = st.columns([1, 1], gap="large")
+left_col, middle_col, right_col = st.columns([1, 1, 1], gap="large")
 
 with left_col:
     st.markdown(
@@ -1062,6 +1263,25 @@ with left_col:
     manual_codes_text = st.text_area(
         "Product codes",
         placeholder="Example:\nPHL046677568283\nZMB12345",
+        height=90,
+        label_visibility="collapsed",
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with middle_col:
+    st.markdown(
+        """
+<div class="tool-card">
+    <div class="section-title">FUMAGALLI product names</div>
+    <div class="section-subtitle">FUMAGALLI items use names, not codes. Add one product name per line.</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    fumagalli_names_text = st.text_area(
+        "FUMAGALLI product names",
+        placeholder="Example:\nCarlo\nGermana\nBeppe 400 E27",
         height=90,
         label_visibility="collapsed",
     )
@@ -1140,6 +1360,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 manual_codes = extract_codes_from_text(manual_codes_text)
 all_codes = dedupe_preserve_order(manual_codes + excel_codes)
+fumagalli_names = dedupe_names_preserve_order(extract_names_from_text(fumagalli_names_text))
 
 philips_count = len([code for code in all_codes if get_product_type(code) == "philips"])
 zambelis_count = len([code for code in all_codes if get_product_type(code) == "zambelis"])
@@ -1147,7 +1368,7 @@ unknown_count = len([code for code in all_codes if get_product_type(code) == "un
 
 st.markdown("### Summary before download")
 
-metric_1, metric_2, metric_3 = st.columns(3)
+metric_1, metric_2, metric_3, metric_4 = st.columns(4)
 
 with metric_1:
     st.metric("Manual codes", len(manual_codes))
@@ -1156,9 +1377,12 @@ with metric_2:
     st.metric("Excel codes", len(excel_codes))
 
 with metric_3:
-    st.metric("Unique total", len(all_codes))
+    st.metric("FUMAGALLI names", len(fumagalli_names))
 
-brand_metric_1, brand_metric_2, brand_metric_3 = st.columns(3)
+with metric_4:
+    st.metric("Unique total", len(all_codes) + len(fumagalli_names))
+
+brand_metric_1, brand_metric_2, brand_metric_3, brand_metric_4 = st.columns(4)
 
 with brand_metric_1:
     st.metric("Philips codes", philips_count)
@@ -1167,20 +1391,30 @@ with brand_metric_2:
     st.metric("Zambelis codes", zambelis_count)
 
 with brand_metric_3:
+    st.metric("FUMAGALLI names", len(fumagalli_names))
+
+with brand_metric_4:
     st.metric("Unknown prefix", unknown_count)
 
-if all_codes:
-    with st.expander("View detected codes"):
-        st.write(all_codes)
+if all_codes or fumagalli_names:
+    with st.expander("View detected items"):
+        if all_codes:
+            st.write("Product codes:", all_codes)
+        if fumagalli_names:
+            st.write("FUMAGALLI names:", fumagalli_names)
 
 # ============================================================
 # Download + Merge Action
 # ============================================================
 
+download_jobs = [("code", code) for code in all_codes] + [
+    ("fumagalli", name) for name in fumagalli_names
+]
+
 download_button = st.button(
     "Download and merge datasheets",
     type="primary",
-    disabled=len(all_codes) == 0,
+    disabled=len(download_jobs) == 0,
 )
 
 if download_button:
@@ -1188,30 +1422,41 @@ if download_button:
 
     st.info("Downloading datasheets...")
 
-    results_by_code = {}
+    results_by_job = {}
     progress_bar = st.progress(0)
     status_text = st.empty()
 
+    def run_download_job(kind: str, value: str) -> dict:
+        if kind == "fumagalli":
+            return download_fumagalli_datasheet(value)
+        return download_datasheet(value)
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_map = {executor.submit(download_datasheet, code): code for code in all_codes}
+        future_map = {
+            executor.submit(run_download_job, kind, value): (kind, value)
+            for kind, value in download_jobs
+        }
         completed = 0
 
         for future in as_completed(future_map):
-            code = future_map[future]
+            kind, value = future_map[future]
 
             try:
                 result = future.result()
             except Exception as e:
-                product_type = get_product_type(code)
-                if product_type == "philips":
-                    brand = "Philips"
-                elif product_type == "zambelis":
-                    brand = "Zambelis"
+                if kind == "fumagalli":
+                    brand = "Fumagalli"
                 else:
-                    brand = "Unknown"
+                    product_type = get_product_type(value)
+                    if product_type == "philips":
+                        brand = "Philips"
+                    elif product_type == "zambelis":
+                        brand = "Zambelis"
+                    else:
+                        brand = "Unknown"
 
                 result = {
-                    "code": code,
+                    "code": value,
                     "brand": brand,
                     "success": False,
                     "url": "",
@@ -1219,12 +1464,12 @@ if download_button:
                     "content": None,
                 }
 
-            results_by_code[code] = result
+            results_by_job[(kind, value)] = result
             completed += 1
-            progress_bar.progress(completed / len(all_codes))
-            status_text.write(f"Processed {completed} / {len(all_codes)}")
+            progress_bar.progress(completed / len(download_jobs))
+            status_text.write(f"Processed {completed} / {len(download_jobs)}")
 
-    results = [results_by_code[code] for code in all_codes if code in results_by_code]
+    results = [results_by_job[job] for job in download_jobs if job in results_by_job]
     successful = [item for item in results if item["success"]]
     failed = [item for item in results if not item["success"]]
 
@@ -1233,7 +1478,7 @@ if download_button:
     result_col_1, result_col_2, result_col_3 = st.columns(3)
 
     with result_col_1:
-        st.metric("Submitted", len(all_codes))
+        st.metric("Submitted", len(download_jobs))
 
     with result_col_2:
         st.metric("Downloaded", len(successful))
@@ -1247,7 +1492,7 @@ if download_button:
         failed_table = pd.DataFrame(
             [
                 {
-                    "Code": item["code"],
+                    "Code / Name": item["code"],
                     "Brand": item.get("brand", ""),
                     "URL": item["url"],
                     "Error": item["error"],
