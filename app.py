@@ -1749,7 +1749,7 @@ with right_col:
             df_preview = pd.read_excel(uploaded_file)
 
             st.caption("Excel preview")
-            st.dataframe(df_preview.head(), use_container_width=False)
+            st.dataframe(df_preview.head())
 
             excel_items, excel_error = extract_items_from_excel(uploaded_file)
             if excel_error:
