@@ -2,7 +2,9 @@ import io
 import re
 import sys
 import time
+import threading
 import subprocess
+from html import unescape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urljoin, urlparse
 
@@ -81,6 +83,15 @@ ZAMBELIS_URL_PATTERNS = [
 ]
 
 FUMAGALLI_DOWNLOADS_URL = "https://www.fumagalli.it/en/downloads/"
+FUMAGALLI_CATALOG_TTL = 3600  # refresh the cached product list every hour
+FUMAGALLI_MAX_PAGES = 6
+
+# Description words that never appear in Fumagalli catalogue names
+FUMAGALLI_NOISE_TOKENS = {
+    "mod", "model", "cm", "mm", "d", "diam", "diameter", "h",
+    "grey", "gray", "black", "white", "green", "brown", "beige",
+    "anthracite", "rust", "antique", "opal", "clear", "smoked",
+}
 
 # ============================================================
 # Helpers
@@ -769,9 +780,202 @@ def search_fumagalli_products(query: str) -> tuple[list[dict], str]:
         return [], str(e)
 
 
+_FUMAGALLI_CATALOG_CACHE: dict = {"timestamp": 0.0, "products": []}
+_FUMAGALLI_CATALOG_LOCK = threading.Lock()
+
+
+def fetch_fumagalli_catalog() -> list[dict]:
+    """Fetch the full Fumagalli product list from all downloads pages (cached)."""
+    with _FUMAGALLI_CATALOG_LOCK:
+        age = time.time() - _FUMAGALLI_CATALOG_CACHE["timestamp"]
+        if _FUMAGALLI_CATALOG_CACHE["products"] and age < FUMAGALLI_CATALOG_TTL:
+            return _FUMAGALLI_CATALOG_CACHE["products"]
+
+        products = []
+        seen = set()
+
+        for page in range(1, FUMAGALLI_MAX_PAGES + 1):
+            url = FUMAGALLI_DOWNLOADS_URL if page == 1 else f"{FUMAGALLI_DOWNLOADS_URL}page/{page}/"
+
+            try:
+                response = requests.get(
+                    url,
+                    timeout=DEFAULT_TIMEOUT,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "Accept": "text/html,*/*",
+                    },
+                )
+            except Exception:
+                break
+
+            if response.status_code != 200:
+                break
+
+            page_products = parse_fumagalli_products(response.text)
+            if not page_products:
+                break
+
+            for product in page_products:
+                key = product["name"].casefold()
+                if key not in seen:
+                    seen.add(key)
+                    products.append(product)
+
+        if products:
+            _FUMAGALLI_CATALOG_CACHE["products"] = products
+            _FUMAGALLI_CATALOG_CACHE["timestamp"] = time.time()
+
+        return products
+
+
+def fumagalli_tokens(text: str) -> list[str]:
+    """Tokenize a product name or free-form description for matching.
+
+    Attribute words that never appear in catalogue names (colors, wattage,
+    color temperature, IP rating) are dropped, and dimensions in cm are
+    converted to the mm numbers used by catalogue names (D 6 CM -> 60).
+    """
+    text = unescape(str(text)).lower()
+    text = text.replace("/", " ").replace("-", " ").replace("_", " ")
+
+    extra_tokens = []
+    for match in re.finditer(r"\b(\d+(?:[.,]\d+)?)\s*cm\b", text):
+        value = float(match.group(1).replace(",", "."))
+        extra_tokens.append(str(int(round(value * 10))))
+
+    text = re.sub(r"\b\d+(?:[.,]\d+)?\s*w\b", " ", text)  # wattage: 8.5W
+    text = re.sub(r"\b\d{3,4}\s*k\b", " ", text)  # color temperature: 3000K
+    text = re.sub(r"\bip\s*\d+\b", " ", text)  # IP rating
+    text = re.sub(r"\b\d+(?:[.,]\d+)?\s*cm\b", " ", text)  # converted dimensions
+
+    tokens = re.findall(r"[a-z]+\d+[a-z0-9]*|[a-z]+|\d+(?:\.\d+)?", text)
+    return [t for t in tokens if t not in FUMAGALLI_NOISE_TOKENS] + extra_tokens
+
+
+def fumagalli_name_tokens(name: str) -> list[str]:
+    """Tokens of a catalogue product name ('Range' is decorative, not matching)."""
+    return [t for t in fumagalli_tokens(name) if t != "range"]
+
+
+def resolve_fumagalli_product(description: str, products: list[dict]) -> tuple[dict | None, str]:
+    """Match a product name or free-form description to one catalogue product.
+
+    Returns (product, note). product is None when there is no confident match,
+    and the note explains why (ambiguous, unknown family, ...).
+    """
+    desc_norm = re.sub(r"\s+", " ", unescape(str(description))).strip().casefold()
+    usable = [p for p in products if p["technical_pdf"]]
+
+    for product in usable:
+        if unescape(product["name"]).strip().casefold() == desc_norm:
+            return product, "exact name match"
+
+    desc_tokens = set(fumagalli_tokens(description))
+    scored = []
+
+    for product in usable:
+        name_tokens = set(fumagalli_name_tokens(product["name"]))
+        if not name_tokens:
+            continue
+
+        family_token = fumagalli_name_tokens(product["name"])[0]
+        if family_token not in desc_tokens:
+            continue
+
+        matched = len(name_tokens & desc_tokens)
+        scored.append((matched, len(name_tokens), product))
+
+    if not scored:
+        return None, "no catalogue product matches this description"
+
+    # Products whose name words are ALL present in the description.
+    full = [(total, product) for matched, total, product in scored if matched == total]
+    if full:
+        full.sort(key=lambda item: item[0], reverse=True)
+        best_total = full[0][0]
+        best = [product for total, product in full if total == best_total]
+
+        if len(best) == 1:
+            return best[0], "matched all name words"
+
+        return None, "ambiguous between: " + ", ".join(p["name"] for p in best)
+
+    # Otherwise pick the product with the most matched words, if unique.
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_matched = scored[0][0]
+    best = [product for matched, total, product in scored if matched == best_matched]
+
+    if best_matched >= 2 and len(best) == 1:
+        return best[0], "closest catalogue match"
+
+    candidates = ", ".join(dict.fromkeys(product["name"] for _, _, product in scored))
+    return None, f"description is not specific enough; possible products: {candidates}"
+
+
+def fetch_fumagalli_pdf(display_name: str, product: dict) -> dict:
+    """Download and validate the Technical Details PDF of a matched product."""
+    pdf_url = product["technical_pdf"]
+
+    try:
+        response = requests.get(
+            pdf_url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/pdf,*/*",
+                "Referer": FUMAGALLI_DOWNLOADS_URL,
+            },
+        )
+
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+
+        content = response.content or b""
+        validate_pdf_content(content)
+
+        return {
+            "code": display_name,
+            "brand": "Fumagalli",
+            "success": True,
+            "url": pdf_url,
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "code": display_name,
+            "brand": "Fumagalli",
+            "success": False,
+            "url": pdf_url,
+            "error": f"Matched product '{product['name']}' but the PDF download failed: {e}",
+            "content": None,
+        }
+
+
 def download_fumagalli_datasheet(name: str) -> dict:
-    """Download the Technical Details PDF for one FUMAGALLI product name."""
+    """Download the Technical Details PDF for one FUMAGALLI name or description."""
     query = normalize_product_name(name)
+
+    catalog = fetch_fumagalli_catalog()
+
+    if catalog:
+        product, note = resolve_fumagalli_product(query, catalog)
+
+        if product is None:
+            return {
+                "code": name,
+                "brand": "Fumagalli",
+                "success": False,
+                "url": FUMAGALLI_DOWNLOADS_URL,
+                "error": f"Could not match '{query}' to a FUMAGALLI catalogue product: {note}",
+                "content": None,
+            }
+
+        return fetch_fumagalli_pdf(name, product)
+
+    # Catalogue unavailable - fall back to the on-site search.
     key = query.casefold()
 
     products, last_error = search_fumagalli_products(query)
@@ -813,43 +1017,7 @@ def download_fumagalli_datasheet(name: str) -> dict:
             "content": None,
         }
 
-    pdf_url = match["technical_pdf"]
-
-    try:
-        response = requests.get(
-            pdf_url,
-            timeout=DEFAULT_TIMEOUT,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Accept": "application/pdf,*/*",
-                "Referer": FUMAGALLI_DOWNLOADS_URL,
-            },
-        )
-
-        if response.status_code != 200:
-            raise ValueError(f"HTTP {response.status_code}")
-
-        content = response.content or b""
-        validate_pdf_content(content)
-
-        return {
-            "code": name,
-            "brand": "Fumagalli",
-            "success": True,
-            "url": pdf_url,
-            "error": "",
-            "content": content,
-        }
-
-    except Exception as e:
-        return {
-            "code": name,
-            "brand": "Fumagalli",
-            "success": False,
-            "url": pdf_url,
-            "error": f"Matched product '{match['name']}' but the PDF download failed: {e}",
-            "content": None,
-        }
+    return fetch_fumagalli_pdf(name, match)
 
 
 def download_datasheet(code: str) -> dict:
@@ -1274,14 +1442,14 @@ with middle_col:
         """
 <div class="tool-card">
     <div class="section-title">FUMAGALLI product names</div>
-    <div class="section-subtitle">FUMAGALLI items use names, not codes. Add one product name per line.</div>
+    <div class="section-subtitle">FUMAGALLI items use names, not codes. Paste product names or full descriptions, one per line.</div>
 """,
         unsafe_allow_html=True,
     )
 
     fumagalli_names_text = st.text_area(
         "FUMAGALLI product names",
-        placeholder="Example:\nCarlo\nGermana\nBeppe 400 E27",
+        placeholder="Example:\nCarlo\nMod. Abram 190 Grey 8.5W 3000K\nMod Livia D 6 CM Grey 1.7W 4000K",
         height=90,
         label_visibility="collapsed",
     )
@@ -1400,8 +1568,33 @@ if all_codes or fumagalli_names:
     with st.expander("View detected items"):
         if all_codes:
             st.write("Product codes:", all_codes)
+
         if fumagalli_names:
-            st.write("FUMAGALLI names:", fumagalli_names)
+            st.write("FUMAGALLI items:")
+
+            try:
+                catalog_preview = fetch_fumagalli_catalog()
+            except Exception:
+                catalog_preview = []
+
+            if catalog_preview:
+                preview_rows = []
+                for fumagalli_name in fumagalli_names:
+                    matched_product, match_note = resolve_fumagalli_product(
+                        normalize_product_name(fumagalli_name),
+                        catalog_preview,
+                    )
+                    preview_rows.append(
+                        {
+                            "Input": fumagalli_name,
+                            "Matched product": matched_product["name"] if matched_product else "No match",
+                            "Note": "" if matched_product else match_note,
+                        }
+                    )
+
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+            else:
+                st.write(fumagalli_names)
 
 # ============================================================
 # Download + Merge Action
