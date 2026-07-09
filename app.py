@@ -13,6 +13,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
+from pypdf.annotations import Link
+from pypdf.generic import Fit
 from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas as pdf_canvas
 
@@ -99,6 +101,16 @@ COVER_TEXT_MAX_WIDTH = 340  # keep the text inside the white area
 COVER_TEXT_FONT = "Helvetica-Bold"
 COVER_TEXT_FONT_SIZE = 34
 COVER_TEXT_MIN_FONT_SIZE = 18
+
+# Table of contents at the beginning of the merged PDF
+TOC_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "toc_logo.png")
+TOC_ACCENT_COLOR = "#1F4EA1"
+TOC_TITLE_COLOR = "#102033"
+TOC_DOTS_COLOR = "#9AA7B5"
+TOC_MARGIN_X = 48
+TOC_ENTRY_SPACING = 28
+TOC_ENTRIES_FIRST_PAGE = 18
+TOC_ENTRIES_LATER_PAGES = 22
 
 FUMAGALLI_DOWNLOADS_URL = "https://www.fumagalli.it/en/downloads/"
 FUMAGALLI_CATALOG_TTL = 3600  # refresh the cached product list every hour
@@ -1300,27 +1312,208 @@ def build_cover_page(template_bytes: bytes, type_text: str):
     return page
 
 
+def toc_pages_needed(entry_count: int) -> int:
+    """Number of pages the table of contents itself will occupy."""
+    if entry_count <= TOC_ENTRIES_FIRST_PAGE:
+        return 1
+
+    remaining = entry_count - TOC_ENTRIES_FIRST_PAGE
+    extra_pages = -(-remaining // TOC_ENTRIES_LATER_PAGES)  # ceiling division
+    return 1 + extra_pages
+
+
+def build_toc_pdf(
+    entries: list[dict],
+    page_width: float,
+    page_height: float,
+) -> tuple[bytes, list[dict]]:
+    """Draw the table of contents pages.
+
+    entries: [{"title": str, "target_page": int}] where target_page is the
+    0-based page index of the item's cover page in the final document.
+
+    Returns (pdf_bytes, link_boxes). link_boxes hold the clickable rectangle
+    of every entry: [{"page": toc_page_index, "rect": (x0,y0,x1,y1), "target": int}].
+    """
+    buffer = io.BytesIO()
+    toc = pdf_canvas.Canvas(buffer, pagesize=(page_width, page_height))
+
+    accent = HexColor(TOC_ACCENT_COLOR)
+    title_color = HexColor(TOC_TITLE_COLOR)
+    dots_color = HexColor(TOC_DOTS_COLOR)
+
+    number_x = TOC_MARGIN_X
+    title_x = TOC_MARGIN_X + 34
+    page_num_right = page_width - TOC_MARGIN_X
+    max_title_width = page_num_right - title_x - 60
+
+    def truncate(text: str, font: str, size: float) -> str:
+        if toc.stringWidth(text, font, size) <= max_title_width:
+            return text
+        while text and toc.stringWidth(text + "...", font, size) > max_title_width:
+            text = text[:-1]
+        return text.rstrip() + "..."
+
+    def draw_first_page_header() -> float:
+        """Draw logo + title, return the y where entries start."""
+        y_top = page_height - 52
+
+        try:
+            from reportlab.lib.utils import ImageReader
+
+            logo = ImageReader(TOC_LOGO_PATH)
+            logo_w, logo_h = logo.getSize()
+            draw_h = 26
+            draw_w = logo_w * draw_h / logo_h
+            toc.drawImage(
+                logo,
+                TOC_MARGIN_X,
+                y_top - draw_h,
+                width=draw_w,
+                height=draw_h,
+                mask="auto",
+            )
+        except Exception:
+            pass
+
+        title_y = y_top - 64
+        toc.setFillColor(title_color)
+        toc.setFont("Helvetica-Bold", 27)
+        toc.drawString(TOC_MARGIN_X, title_y, "Table of Contents")
+
+        toc.setFillColor(accent)
+        toc.rect(TOC_MARGIN_X, title_y - 14, 64, 4, stroke=0, fill=1)
+
+        return title_y - 52
+
+    def draw_later_page_header() -> float:
+        toc.setFillColor(dots_color)
+        toc.setFont("Helvetica", 11)
+        toc.drawString(TOC_MARGIN_X, page_height - 56, "Table of Contents (continued)")
+        toc.setFillColor(accent)
+        toc.rect(TOC_MARGIN_X, page_height - 64, 42, 2.6, stroke=0, fill=1)
+        return page_height - 100
+
+    link_boxes = []
+    toc_page_index = 0
+    y = draw_first_page_header()
+    capacity = TOC_ENTRIES_FIRST_PAGE
+    drawn_on_page = 0
+
+    for position, entry in enumerate(entries, start=1):
+        if drawn_on_page >= capacity:
+            toc.showPage()
+            toc_page_index += 1
+            y = draw_later_page_header()
+            capacity = TOC_ENTRIES_LATER_PAGES
+            drawn_on_page = 0
+
+        title = truncate(entry["title"], "Helvetica-Bold", 12.5)
+        page_label = str(entry["target_page"] + 1)
+
+        toc.setFillColor(accent)
+        toc.setFont("Helvetica-Bold", 10.5)
+        toc.drawString(number_x, y, f"{position:02d}")
+
+        toc.setFillColor(title_color)
+        toc.setFont("Helvetica-Bold", 12.5)
+        toc.drawString(title_x, y, title)
+
+        toc.setFont("Helvetica-Bold", 11.5)
+        toc.setFillColor(accent)
+        toc.drawRightString(page_num_right, y, page_label)
+
+        title_end = title_x + toc.stringWidth(title, "Helvetica-Bold", 12.5) + 8
+        num_start = page_num_right - toc.stringWidth(page_label, "Helvetica-Bold", 11.5) - 8
+        if num_start > title_end + 12:
+            toc.setFillColor(dots_color)
+            toc.setFont("Helvetica", 10)
+            dot = "."
+            dot_width = toc.stringWidth(dot, "Helvetica", 10) + 3.2
+            x = title_end
+            while x < num_start:
+                toc.drawString(x, y + 1, dot)
+                x += dot_width
+
+        link_boxes.append(
+            {
+                "page": toc_page_index,
+                "rect": (TOC_MARGIN_X - 6, y - 8, page_num_right + 6, y + 14),
+                "target": entry["target_page"],
+            }
+        )
+
+        y -= TOC_ENTRY_SPACING
+        drawn_on_page += 1
+
+    toc.save()
+    return buffer.getvalue(), link_boxes
+
+
 def merge_pdfs(items: list[dict], template_bytes: bytes | None) -> bytes:
     """Merge every item's datasheet into one PDF.
 
-    Each successful item contributes a cover page (the template with the
-    item's Type written on it) followed by its datasheet. Items are kept in
-    order and duplicates are NOT removed: every item gets its own cover and
-    datasheet even when two items share the same datasheet file.
+    The document starts with a clickable table of contents listing each
+    item's Type. Every successful item then contributes a cover page (the
+    template with the item's Type written on it) followed by its datasheet.
+    Items are kept in order and duplicates are NOT removed: every item gets
+    its own cover and datasheet even when two items share the same file.
     """
-    writer = PdfWriter()
-
+    prepared = []
     for item in items:
         result = item["result"]
         if not result["success"]:
             continue
+        reader = PdfReader(io.BytesIO(result["content"]))
+        prepared.append((item, reader))
 
+    if not prepared:
+        return b""
+
+    cover_pages = 1 if template_bytes else 0
+    toc_page_count = toc_pages_needed(len(prepared))
+
+    if template_bytes:
+        template_page = PdfReader(io.BytesIO(template_bytes)).pages[0]
+        page_width = float(template_page.mediabox.width)
+        page_height = float(template_page.mediabox.height)
+    else:
+        first_page = prepared[0][1].pages[0]
+        page_width = float(first_page.mediabox.width)
+        page_height = float(first_page.mediabox.height)
+
+    entries = []
+    cursor = toc_page_count
+    for item, reader in prepared:
+        title = item.get("type", "").strip() or item.get("display", "") or "Item"
+        entries.append({"title": title, "target_page": cursor})
+        cursor += cover_pages + len(reader.pages)
+
+    toc_bytes, link_boxes = build_toc_pdf(entries, page_width, page_height)
+
+    writer = PdfWriter()
+
+    for page in PdfReader(io.BytesIO(toc_bytes)).pages:
+        writer.add_page(page)
+
+    for item, reader in prepared:
         if template_bytes:
             writer.add_page(build_cover_page(template_bytes, item.get("type", "")))
-
-        reader = PdfReader(io.BytesIO(result["content"]))
         for page in reader.pages:
             writer.add_page(page)
+
+    for box in link_boxes:
+        writer.add_annotation(
+            page_number=box["page"],
+            annotation=Link(
+                rect=box["rect"],
+                target_page_index=box["target"],
+                fit=Fit(fit_type="/Fit"),
+            ),
+        )
+
+    for entry in entries:
+        writer.add_outline_item(entry["title"], entry["target_page"])
 
     output = io.BytesIO()
     writer.write(output)
