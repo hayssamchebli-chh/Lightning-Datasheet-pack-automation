@@ -292,6 +292,37 @@ def dedupe_names_preserve_order(items: list[str]) -> list[str]:
     return result
 
 
+def drop_untyped_duplicates(items: list[dict]) -> list[dict]:
+    """Apply the duplicates rule to the item list.
+
+    Items WITH a Type always keep their own cover page + datasheet, even
+    when several items share the same code/description. Items WITHOUT a
+    Type are included only once: repeated untyped occurrences are dropped,
+    and an untyped occurrence is also dropped when the same product appears
+    elsewhere with a Type (its datasheet is already in the pack).
+    """
+    typed_keys = {
+        (item["kind"], str(item["value"]).casefold())
+        for item in items
+        if item.get("type", "").strip()
+    }
+
+    seen_untyped = set()
+    result = []
+
+    for item in items:
+        key = (item["kind"], str(item["value"]).casefold())
+
+        if not item.get("type", "").strip():
+            if key in typed_keys or key in seen_untyped:
+                continue
+            seen_untyped.add(key)
+
+        result.append(item)
+
+    return result
+
+
 def dedupe_preserve_order(items: list[str]) -> list[str]:
     """Remove duplicates while preserving the first appearance order."""
     seen = set()
@@ -1989,7 +2020,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 manual_codes = dedupe_preserve_order(extract_codes_from_text(manual_codes_text))
 fumagalli_names = dedupe_names_preserve_order(extract_names_from_text(fumagalli_names_text))
 
-all_items = (
+all_items = drop_untyped_duplicates(
     [{"kind": "code", "value": code, "type": "", "display": code} for code in manual_codes]
     + [{"kind": "fumagalli", "value": name, "type": "", "display": name} for name in fumagalli_names]
     + excel_items
