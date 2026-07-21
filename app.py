@@ -1751,27 +1751,38 @@ def download_lluria_datasheet(query: str) -> dict:
         }
 
 
-def olympia_request(url: str, accept: str, referer: str = "", attempts: int = 3):
-    """GET an Olympia URL, retrying briefly when the site throttles requests.
+def olympia_request(
+    url: str,
+    accept: str,
+    referer: str = "",
+    session=None,
+    method: str = "get",
+    data: dict | None = None,
+    extra_headers: dict | None = None,
+    attempts: int = 3,
+):
+    """Request an Olympia URL, retrying briefly when the site throttles.
 
     The site can refuse connections when several downloads run in parallel,
     so failed attempts are retried with a short increasing delay.
     """
+    client = session if session is not None else requests
     last_error = None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": accept,
+        "Accept-Language": "en",
+        **({"Referer": referer} if referer else {}),
+        **(extra_headers or {}),
+    }
 
     for attempt in range(1, attempts + 1):
         try:
-            response = requests.get(
-                url,
-                timeout=DEFAULT_TIMEOUT,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    ),
-                    "Accept": accept,
-                    **({"Referer": referer} if referer else {}),
-                },
-            )
+            if method == "post":
+                response = client.post(url, data=data, timeout=DEFAULT_TIMEOUT, headers=headers)
+            else:
+                response = client.get(url, timeout=DEFAULT_TIMEOUT, headers=headers)
 
             if response.status_code >= 500 and attempt < attempts:
                 last_error = f"HTTP {response.status_code}"
@@ -1788,51 +1799,113 @@ def olympia_request(url: str, accept: str, referer: str = "", attempts: int = 3)
     return None, last_error or "request failed"
 
 
-def search_olympia_products(code: str) -> tuple[list[dict], str]:
-    """Look a code up in the Olympia Electronics content finder autocomplete.
-
-    Returns candidate products as {"label", "path", "slug"}. The site expects
-    the code with its slashes intact in the URL path, so "/" is not encoded.
-    """
-    response, error = olympia_request(
-        OLYMPIA_AUTOCOMPLETE_URL + quote(code, safe="/"),
-        accept="application/json,*/*",
-        referer=OLYMPIA_FINDER_URL,
-    )
-
-    if response is None:
-        return [], error
-
-    if response.status_code != 200:
-        return [], f"HTTP {response.status_code} from the Olympia content finder"
-
-    try:
-        suggestions = response.json()
-    except Exception:
-        return [], "the Olympia content finder returned an unreadable response"
-
-    # Drupal returns an empty list (not a dict) when nothing matches.
-    if isinstance(suggestions, list) and not suggestions:
-        return [], ""
-
-    if not isinstance(suggestions, dict):
-        return [], "unexpected response from the Olympia content finder"
-
+def parse_olympia_product_links(html: str) -> list[dict]:
+    """Extract titled product links from Olympia finder result HTML."""
     products = []
-    for label, snippet in suggestions.items():
-        match = re.search(r'href="(/[a-z]{2}/product/[^"]+)"', str(snippet))
-        if not match:
+    seen = set()
+
+    for match in re.finditer(
+        r'<a\s+href="(/[a-z]{2}/product/[^"]+)"[^>]*>(.*?)</a>',
+        str(html),
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        path = unescape(match.group(1))
+        label = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", match.group(2))).strip()
+
+        if not label or path in seen:
             continue
 
-        path = unescape(match.group(1))
+        seen.add(path)
         products.append(
             {
-                "label": re.sub(r"\s+", " ", unescape(str(label))).strip(),
+                "label": unescape(label),
                 "path": path,
                 "slug": path.rstrip("/").split("/")[-1],
             }
         )
 
+    return products
+
+
+def search_olympia_products(code: str) -> tuple[list[dict], str]:
+    """Look a code up in the Olympia Electronics content finder.
+
+    Two layers, sharing one browser-like session:
+    1. The finder's autocomplete endpoint (fast; slashes must stay raw).
+    2. Submitting the finder form itself, exactly like a visitor pressing
+       "Find". Some networks get an empty autocomplete answer, and the form
+       results are returned even with a non-200 status, so the body is parsed
+       regardless.
+
+    Returns candidate products as {"label", "path", "slug"}.
+    """
+    session = requests.Session()
+
+    # Prime the session like a real visit: cookies + the form build id.
+    finder_response, _ = olympia_request(
+        OLYMPIA_FINDER_URL, accept="text/html,*/*", session=session
+    )
+
+    # Layer 1: autocomplete.
+    response, error = olympia_request(
+        OLYMPIA_AUTOCOMPLETE_URL + quote(code, safe="/"),
+        accept="application/json,*/*",
+        referer=OLYMPIA_FINDER_URL,
+        session=session,
+        extra_headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+
+    if response is not None and response.status_code == 200:
+        try:
+            suggestions = response.json()
+        except Exception:
+            suggestions = None
+
+        if isinstance(suggestions, dict) and suggestions:
+            products = []
+            for label, snippet in suggestions.items():
+                match = re.search(r'href="(/[a-z]{2}/product/[^"]+)"', str(snippet))
+                if not match:
+                    continue
+
+                path = unescape(match.group(1))
+                products.append(
+                    {
+                        "label": re.sub(r"\s+", " ", unescape(str(label))).strip(),
+                        "path": path,
+                        "slug": path.rstrip("/").split("/")[-1],
+                    }
+                )
+
+            if products:
+                return products, ""
+
+    # Layer 2: submit the finder form like the browser does.
+    form_build_id = ""
+    if finder_response is not None and finder_response.status_code == 200:
+        match = re.search(r'name="form_build_id" value="([^"]+)"', finder_response.text)
+        if match:
+            form_build_id = match.group(1)
+
+    form_response, form_error = olympia_request(
+        OLYMPIA_FINDER_URL,
+        accept="text/html,*/*",
+        referer=OLYMPIA_FINDER_URL,
+        session=session,
+        method="post",
+        data={
+            "title": code,
+            "find": "Find",
+            "form_build_id": form_build_id,
+            "form_id": "finder_form_content_finder",
+        },
+    )
+
+    if form_response is None:
+        return [], form_error or error
+
+    # The finder returns its results even with a non-200 status code.
+    products = parse_olympia_product_links(form_response.text)
     return products, ""
 
 
@@ -1928,6 +2001,15 @@ def download_olympia_datasheet(code: str) -> dict:
         }
 
     product, note = resolve_olympia_product(search_code, products)
+
+    # The finder's text search can miss codes with slashes (GR-312/30L/A):
+    # retry with the base part of the code and pick the exact variant.
+    if product is None and "/" in search_code:
+        base_products, _ = search_olympia_products(search_code.split("/")[0])
+        if base_products:
+            base_product, base_note = resolve_olympia_product(search_code, base_products)
+            if base_product is not None:
+                product, note = base_product, base_note
 
     if product is None:
         return {
