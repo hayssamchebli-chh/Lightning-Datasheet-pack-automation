@@ -157,14 +157,14 @@ def get_product_type(code: str) -> str:
         return "philips"
     if code.startswith("ZMB"):
         return "zambelis"
-    if code.startswith("TEC"):
+    if code.startswith("TCMA"):
         return "tecmar"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
     """Remove the brand prefix before searching vendor websites."""
-    for prefix in ("TECMAR", "TEC-MAR", "PHL", "ZMB", "TEC"):
+    for prefix in ("TCMA", "PHL", "ZMB"):
         if code.startswith(prefix):
             cleaned = code[len(prefix):]
             break
@@ -196,7 +196,7 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
     Expected columns (matched by name, falling back to column position):
     1. Type        - written on the cover page before the item's datasheet
     2. Code        - PHL/ZMB codes search by code; FUM codes use the
-                     Description; TEC codes use their article code when they
+                     Description; TCMA codes use their article code when they
                      carry one, otherwise the Description
     3. Description - FUMAGALLI / TEC-MAR product name or full description
 
@@ -253,10 +253,10 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
                     "display": f"{code} - {description}" if description else code,
                 }
             )
-        elif code.startswith("TEC"):
+        elif code.startswith("TCMA"):
             # TEC-MAR items are searched with the code and the Description
             # together: the resolver uses the article code when the code
-            # carries a real one (TEC-6102) and falls back to the product
+            # carries a real one (TCMA-6102) and falls back to the product
             # name in the Description otherwise.
             bare_code = strip_product_prefix(code)
             search_value = f"{bare_code} {description}".strip()
@@ -1366,7 +1366,7 @@ def resolve_tecmar_family(query: str, families: list[dict]) -> tuple[dict | None
     if not query:
         return None, "empty TEC-MAR code/description"
 
-    # An article code in the text is the most precise match ("TEC-6102", "6102").
+    # An article code in the text is the most precise match ("TCMA-6102", "6102").
     for token in re.findall(r"\d{3,6}", query):
         for family in families:
             if family["code"] == token:
@@ -1531,7 +1531,7 @@ def download_datasheet(code: str) -> dict:
         "success": False,
         "url": "",
         "error": (
-            "Unknown code prefix. Codes must start with PHL, ZMB or TEC. "
+            "Unknown code prefix. Codes must start with PHL, ZMB or TCMA. "
             "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
         ),
         "content": None,
@@ -2198,14 +2198,14 @@ with left_col:
         """
 <div class="tool-card">
     <div class="section-title">Paste product codes</div>
-    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis and TEC for TEC-MAR article codes.</div>
+    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis and TCMA for TEC-MAR article codes.</div>
 """,
         unsafe_allow_html=True,
     )
 
     manual_codes_text = st.text_area(
         "Product codes",
-        placeholder="Example:\nPHL046677568283\nZMB12345\nTEC-6102",
+        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102",
         height=90,
         label_visibility="collapsed",
     )
@@ -2236,7 +2236,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Columns: Type, Code, and Description. FUM codes use the Description; TEC codes use their article number, or the Description.</div>
+    <div class="section-subtitle">Columns: Type, Code, and Description. FUM codes use the Description; TCMA codes use their article number, or the Description.</div>
 """,
         unsafe_allow_html=True,
     )
