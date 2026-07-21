@@ -124,6 +124,15 @@ TECMAR_CATALOG_TTL = 3600
 TECMAR_MAX_PAGES = 30
 TECMAR_PAGE_SIZE = 100
 
+# Lluria luminaires are WordPress posts under the LUMINARIAS categories, and
+# every product page links its "ficha tecnica" PDF (.../FT/LUMINARIAS/F.T.NAME.pdf).
+LLURIA_API_URL = "https://lluria.com/store/wp-json/wp/v2/posts"
+LLURIA_LUMINAIRE_CATEGORIES = "151,153,159,155,156,161"
+LLURIA_CATALOG_TTL = 3600
+LLURIA_MAX_PAGES = 6
+LLURIA_PAGE_SIZE = 100
+LLURIA_PDF_FALLBACK = "https://lluria.com/store/wp-content/uploads/FT/LUMINARIAS/F.T.{name}.pdf"
+
 # Description words that never appear in Fumagalli catalogue names
 FUMAGALLI_NOISE_TOKENS = {
     "mod", "model", "cm", "mm", "d", "diam", "diameter", "h",
@@ -159,12 +168,14 @@ def get_product_type(code: str) -> str:
         return "zambelis"
     if code.startswith("TCMA"):
         return "tecmar"
+    if code.startswith("LLU"):
+        return "lluria"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
     """Remove the brand prefix before searching vendor websites."""
-    for prefix in ("TCMA", "PHL", "ZMB"):
+    for prefix in ("TCMA", "PHL", "ZMB", "LLU"):
         if code.startswith(prefix):
             cleaned = code[len(prefix):]
             break
@@ -197,11 +208,13 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
     1. Type        - written on the cover page before the item's datasheet
     2. Code        - PHL/ZMB codes search by code; FUM codes use the
                      Description; TCMA codes use their article code when they
-                     carry one, otherwise the Description
-    3. Description - FUMAGALLI / TEC-MAR product name or full description
+                     carry one, otherwise the Description; LLU codes use the
+                     Description
+    3. Description - FUMAGALLI / TEC-MAR / LLURIA product name or description
 
     Returns (items, error_message). Each item is a dict with:
-    kind ("code", "fumagalli" or "tecmar"), value (what to search), type, display.
+    kind ("code", "fumagalli", "tecmar" or "lluria"), value (what to search),
+    type, display.
     """
     uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file)
@@ -265,6 +278,17 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
                 {
                     "kind": "tecmar",
                     "value": search_value,
+                    "type": type_text,
+                    "display": f"{code} - {description}" if description else code,
+                }
+            )
+        elif code.startswith("LLU"):
+            # LLURIA luminaires are identified by name, so search with the
+            # Description, falling back to whatever follows the LLU prefix.
+            items.append(
+                {
+                    "kind": "lluria",
+                    "value": description or strip_product_prefix(code),
                     "type": type_text,
                     "display": f"{code} - {description}" if description else code,
                 }
@@ -1514,6 +1538,208 @@ def download_tecmar_datasheet(query: str) -> dict:
         }
 
 
+_LLURIA_CATALOG_CACHE: dict = {"timestamp": 0.0, "products": []}
+_LLURIA_CATALOG_LOCK = threading.Lock()
+
+
+def fetch_lluria_catalog() -> list[dict]:
+    """Fetch the Lluria luminaire list from the store's REST API (cached)."""
+    with _LLURIA_CATALOG_LOCK:
+        age = time.time() - _LLURIA_CATALOG_CACHE["timestamp"]
+        if _LLURIA_CATALOG_CACHE["products"] and age < LLURIA_CATALOG_TTL:
+            return _LLURIA_CATALOG_CACHE["products"]
+
+        products = []
+        seen = set()
+
+        for page in range(1, LLURIA_MAX_PAGES + 1):
+            try:
+                response = requests.get(
+                    LLURIA_API_URL,
+                    params={
+                        "categories": LLURIA_LUMINAIRE_CATEGORIES,
+                        "per_page": LLURIA_PAGE_SIZE,
+                        "page": page,
+                        "_fields": "slug,title,link",
+                    },
+                    timeout=DEFAULT_TIMEOUT,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "Accept": "application/json",
+                    },
+                )
+            except Exception:
+                break
+
+            if response.status_code != 200:
+                break
+
+            try:
+                batch = response.json()
+            except Exception:
+                break
+
+            if not batch:
+                break
+
+            for product in batch:
+                title = unescape(
+                    re.sub(r"<[^>]+>", "", (product.get("title") or {}).get("rendered", ""))
+                )
+                name = re.sub(r"\s+", " ", title).strip()
+                link = product.get("link") or ""
+
+                if not name or name.casefold() in seen:
+                    continue
+
+                seen.add(name.casefold())
+                products.append({"name": name, "link": link})
+
+            if len(batch) < LLURIA_PAGE_SIZE:
+                break
+
+        if products:
+            _LLURIA_CATALOG_CACHE["products"] = products
+            _LLURIA_CATALOG_CACHE["timestamp"] = time.time()
+
+        return products
+
+
+def resolve_lluria_product(query: str, products: list[dict]) -> tuple[dict | None, str]:
+    """Match a product name or a full description to one Lluria luminaire."""
+    query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query:
+        return None, "empty LLURIA code/description"
+
+    key = query.casefold()
+
+    exact = [p for p in products if p["name"].casefold() == key]
+    if len(exact) == 1:
+        return exact[0], "exact name match"
+
+    tokens = set(fumagalli_tokens(query))
+    scored = []
+
+    for product in products:
+        name_tokens = set(fumagalli_tokens(product["name"]))
+        if name_tokens and name_tokens <= tokens:
+            scored.append((len(name_tokens), product))
+
+    if not scored:
+        return None, f"no LLURIA luminaire matches '{query}'"
+
+    best_size = max(size for size, _ in scored)
+    best = [product for size, product in scored if size == best_size]
+
+    if len(best) == 1:
+        return best[0], f"matched product name '{best[0]['name']}'"
+
+    return None, "ambiguous between: " + ", ".join(p["name"] for p in best[:6])
+
+
+def find_lluria_datasheet_pdf(product: dict) -> tuple[str, str]:
+    """Read a Lluria product page and return its datasheet PDF URL."""
+    try:
+        response = requests.get(
+            product["link"],
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "text/html,*/*",
+            },
+        )
+    except Exception as e:
+        return "", str(e)
+
+    if response.status_code != 200:
+        return "", f"HTTP {response.status_code} for {product['link']}"
+
+    links = re.findall(r'href="([^"]+\.pdf)"', response.text, flags=re.IGNORECASE)
+    datasheets = [unescape(u) for u in links if "/ft/" in u.lower()]
+
+    if datasheets:
+        return datasheets[0], ""
+
+    if links:
+        return unescape(links[0]), ""
+
+    return "", "the product page has no datasheet PDF link"
+
+
+def download_lluria_datasheet(query: str) -> dict:
+    """Download the datasheet PDF for one LLURIA luminaire."""
+    products = fetch_lluria_catalog()
+
+    if not products:
+        return {
+            "code": query,
+            "brand": "Lluria",
+            "success": False,
+            "url": LLURIA_API_URL,
+            "error": "Could not load the LLURIA luminaire list from lluria.com.",
+            "content": None,
+        }
+
+    product, note = resolve_lluria_product(query, products)
+
+    if product is None:
+        return {
+            "code": query,
+            "brand": "Lluria",
+            "success": False,
+            "url": "https://lluria.com/store/en/productos/luminarias",
+            "error": f"Could not match '{query}' to a LLURIA luminaire: {note}",
+            "content": None,
+        }
+
+    pdf_url, error = find_lluria_datasheet_pdf(product)
+
+    if not pdf_url:
+        # The datasheets follow a stable naming pattern, so try it directly
+        # when the product page does not expose the link.
+        pdf_url = LLURIA_PDF_FALLBACK.format(name=quote(product["name"], safe=".-_"))
+
+    try:
+        response = requests.get(
+            pdf_url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/pdf,*/*",
+                "Referer": product["link"],
+            },
+        )
+
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+
+        content = response.content or b""
+        validate_pdf_content(content)
+
+        return {
+            "code": query,
+            "brand": "Lluria",
+            "success": True,
+            "url": pdf_url,
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        detail = f" ({error})" if error else ""
+        return {
+            "code": query,
+            "brand": "Lluria",
+            "success": False,
+            "url": pdf_url,
+            "error": (
+                f"Matched LLURIA luminaire '{product['name']}' but the datasheet "
+                f"download failed: {e}{detail}"
+            ),
+            "content": None,
+        }
+
+
 def download_datasheet(code: str) -> dict:
     """Route product code to the correct vendor downloader."""
     product_type = get_product_type(code)
@@ -1524,6 +1750,8 @@ def download_datasheet(code: str) -> dict:
         return download_zambelis_datasheet(code)
     if product_type == "tecmar":
         return download_tecmar_datasheet(strip_product_prefix(code))
+    if product_type == "lluria":
+        return download_lluria_datasheet(strip_product_prefix(code))
 
     return {
         "code": code,
@@ -1531,7 +1759,7 @@ def download_datasheet(code: str) -> dict:
         "success": False,
         "url": "",
         "error": (
-            "Unknown code prefix. Codes must start with PHL, ZMB or TCMA. "
+            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA or LLU. "
             "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
         ),
         "content": None,
@@ -1836,6 +2064,7 @@ st.markdown(
         --zambelis-cream: #FAF7F0;
         --fumagalli-green: #1E5B3A;
         --tecmar-red: #C72027;
+        --lluria-navy: #14274E;
         --app-bg: #F6F8FB;
         --card-bg: #FFFFFF;
         --text-main: #102033;
@@ -1931,6 +2160,19 @@ st.markdown(
         letter-spacing: 2px;
         line-height: 1;
         box-shadow: 0 8px 20px rgba(199, 32, 39, 0.18);
+    }
+
+    .lluria-logo {
+        background: #ffffff;
+        color: var(--lluria-navy);
+        border: 2px solid var(--lluria-navy);
+        border-radius: 999px;
+        padding: 9px 16px;
+        font-weight: 800;
+        font-size: 18px;
+        letter-spacing: 2px;
+        line-height: 1;
+        box-shadow: 0 8px 20px rgba(20, 39, 78, 0.14);
     }
 
     .brand-badge {
@@ -2169,8 +2411,10 @@ st.markdown(
         <div class="fumagalli-logo">FUMAGALLI</div>
         <div class="brand-divider"></div>
         <div class="tecmar-logo">TEC-MAR</div>
+        <div class="brand-divider"></div>
+        <div class="lluria-logo">LLURIA</div>
     </div>
-    <div class="brand-badge">Philips, Zambelis, FUMAGALLI &amp; TEC-MAR Datasheet Automation</div>
+    <div class="brand-badge">Philips, Zambelis, FUMAGALLI, TEC-MAR &amp; LLURIA Datasheet Automation</div>
 </div>
 
 <div class="hero">
@@ -2198,14 +2442,14 @@ with left_col:
         """
 <div class="tool-card">
     <div class="section-title">Paste product codes</div>
-    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis and TCMA for TEC-MAR article codes.</div>
+    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis, TCMA for TEC-MAR article codes and LLU for LLURIA luminaire names.</div>
 """,
         unsafe_allow_html=True,
     )
 
     manual_codes_text = st.text_area(
         "Product codes",
-        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102",
+        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102\nLLU-KAUS",
         height=90,
         label_visibility="collapsed",
     )
@@ -2236,7 +2480,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Columns: Type, Code, and Description. FUM codes use the Description; TCMA codes use their article number, or the Description.</div>
+    <div class="section-subtitle">Columns: Type, Code, and Description. FUM and LLU codes use the Description; TCMA codes use their article number, or the Description.</div>
 """,
         unsafe_allow_html=True,
     )
@@ -2323,8 +2567,21 @@ tecmar_count = len(
         or (i["kind"] == "code" and get_product_type(i["value"]) == "tecmar")
     ]
 )
+lluria_count = len(
+    [
+        i
+        for i in all_items
+        if i["kind"] == "lluria"
+        or (i["kind"] == "code" and get_product_type(i["value"]) == "lluria")
+    ]
+)
 unknown_count = (
-    len(all_items) - philips_count - zambelis_count - fumagalli_count - tecmar_count
+    len(all_items)
+    - philips_count
+    - zambelis_count
+    - fumagalli_count
+    - tecmar_count
+    - lluria_count
 )
 
 st.markdown("### Summary before download")
@@ -2349,7 +2606,8 @@ with metric_4:
     brand_metric_3,
     brand_metric_4,
     brand_metric_5,
-) = st.columns(5)
+    brand_metric_6,
+) = st.columns(6)
 
 with brand_metric_1:
     st.metric("Philips", philips_count)
@@ -2364,6 +2622,9 @@ with brand_metric_4:
     st.metric("TEC-MAR", tecmar_count)
 
 with brand_metric_5:
+    st.metric("LLURIA", lluria_count)
+
+with brand_metric_6:
     st.metric("Unknown prefix", unknown_count)
 
 if all_items:
@@ -2391,6 +2652,20 @@ if all_items:
             except Exception:
                 tecmar_preview = []
 
+        lluria_items = [
+            i
+            for i in all_items
+            if i["kind"] == "lluria"
+            or (i["kind"] == "code" and get_product_type(i["value"]) == "lluria")
+        ]
+
+        lluria_preview = []
+        if lluria_items:
+            try:
+                lluria_preview = fetch_lluria_catalog()
+            except Exception:
+                lluria_preview = []
+
         overview_rows = []
         for item in all_items:
             product_type = get_product_type(item["value"]) if item["kind"] == "code" else ""
@@ -2417,6 +2692,23 @@ if all_items:
                     matched = (
                         f"{family['code']} {'/'.join(family['names'])}"
                         if family
+                        else f"No match ({match_note})"
+                    )
+            elif item["kind"] == "lluria" or product_type == "lluria":
+                brand = "LLURIA"
+                matched = ""
+                if lluria_preview:
+                    search_value = (
+                        strip_product_prefix(item["value"])
+                        if item["kind"] == "code"
+                        else item["value"]
+                    )
+                    matched_product, match_note = resolve_lluria_product(
+                        search_value, lluria_preview
+                    )
+                    matched = (
+                        matched_product["name"]
+                        if matched_product
                         else f"No match ({match_note})"
                     )
             else:
@@ -2463,6 +2755,8 @@ if download_button:
             return download_fumagalli_datasheet(value)
         if kind == "tecmar":
             return download_tecmar_datasheet(value)
+        if kind == "lluria":
+            return download_lluria_datasheet(value)
         return download_datasheet(value)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -2482,6 +2776,8 @@ if download_button:
                     brand = "Fumagalli"
                 elif kind == "tecmar":
                     brand = "Tec-Mar"
+                elif kind == "lluria":
+                    brand = "Lluria"
                 else:
                     product_type = get_product_type(value)
                     if product_type == "philips":
@@ -2490,6 +2786,8 @@ if download_button:
                         brand = "Zambelis"
                     elif product_type == "tecmar":
                         brand = "Tec-Mar"
+                    elif product_type == "lluria":
+                        brand = "Lluria"
                     else:
                         brand = "Unknown"
 
