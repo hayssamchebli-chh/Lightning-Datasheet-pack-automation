@@ -133,6 +133,14 @@ LLURIA_MAX_PAGES = 6
 LLURIA_PAGE_SIZE = 100
 LLURIA_PDF_FALLBACK = "https://lluria.com/store/wp-content/uploads/FT/LUMINARIAS/F.T.{name}.pdf"
 
+# Olympia Electronics: the content finder autocomplete resolves a product code
+# to its product page, which links the "User Manual" PDF.
+OLYMPIA_BASE_URL = "https://www.olympia-electronics.com"
+OLYMPIA_AUTOCOMPLETE_URL = (
+    OLYMPIA_BASE_URL + "/en/finder_autocomplete/autocomplete/content_finder/title/"
+)
+OLYMPIA_FINDER_URL = OLYMPIA_BASE_URL + "/en/content-finder"
+
 # Description words that never appear in Fumagalli catalogue names
 FUMAGALLI_NOISE_TOKENS = {
     "mod", "model", "cm", "mm", "d", "diam", "diameter", "h",
@@ -156,7 +164,8 @@ def normalize_code(value: str) -> str:
         return ""
 
     value = str(value).strip()
-    value = re.sub(r"[^A-Za-z0-9 \-_\.]", "", value)
+    # "/" is kept because Olympia Electronics codes use it (GR-312/30L/A).
+    value = re.sub(r"[^A-Za-z0-9 \-_\./]", "", value)
     return value.upper()
 
 
@@ -170,12 +179,14 @@ def get_product_type(code: str) -> str:
         return "tecmar"
     if code.startswith("LLU"):
         return "lluria"
+    if code.startswith("OLY"):
+        return "olympia"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
     """Remove the brand prefix before searching vendor websites."""
-    for prefix in ("TCMA", "PHL", "ZMB", "LLU"):
+    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY"):
         if code.startswith(prefix):
             cleaned = code[len(prefix):]
             break
@@ -1740,6 +1751,244 @@ def download_lluria_datasheet(query: str) -> dict:
         }
 
 
+def olympia_request(url: str, accept: str, referer: str = "", attempts: int = 3):
+    """GET an Olympia URL, retrying briefly when the site throttles requests.
+
+    The site can refuse connections when several downloads run in parallel,
+    so failed attempts are retried with a short increasing delay.
+    """
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                url,
+                timeout=DEFAULT_TIMEOUT,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    ),
+                    "Accept": accept,
+                    **({"Referer": referer} if referer else {}),
+                },
+            )
+
+            if response.status_code >= 500 and attempt < attempts:
+                last_error = f"HTTP {response.status_code}"
+                time.sleep(attempt)
+                continue
+
+            return response, ""
+
+        except Exception as e:
+            last_error = str(e)
+            if attempt < attempts:
+                time.sleep(attempt)
+
+    return None, last_error or "request failed"
+
+
+def search_olympia_products(code: str) -> tuple[list[dict], str]:
+    """Look a code up in the Olympia Electronics content finder autocomplete.
+
+    Returns candidate products as {"label", "path", "slug"}. The site expects
+    the code with its slashes intact in the URL path, so "/" is not encoded.
+    """
+    response, error = olympia_request(
+        OLYMPIA_AUTOCOMPLETE_URL + quote(code, safe="/"),
+        accept="application/json,*/*",
+        referer=OLYMPIA_FINDER_URL,
+    )
+
+    if response is None:
+        return [], error
+
+    if response.status_code != 200:
+        return [], f"HTTP {response.status_code} from the Olympia content finder"
+
+    try:
+        suggestions = response.json()
+    except Exception:
+        return [], "the Olympia content finder returned an unreadable response"
+
+    # Drupal returns an empty list (not a dict) when nothing matches.
+    if isinstance(suggestions, list) and not suggestions:
+        return [], ""
+
+    if not isinstance(suggestions, dict):
+        return [], "unexpected response from the Olympia content finder"
+
+    products = []
+    for label, snippet in suggestions.items():
+        match = re.search(r'href="(/[a-z]{2}/product/[^"]+)"', str(snippet))
+        if not match:
+            continue
+
+        path = unescape(match.group(1))
+        products.append(
+            {
+                "label": re.sub(r"\s+", " ", unescape(str(label))).strip(),
+                "path": path,
+                "slug": path.rstrip("/").split("/")[-1],
+            }
+        )
+
+    return products, ""
+
+
+def resolve_olympia_product(code: str, products: list[dict]) -> tuple[dict | None, str]:
+    """Pick the product whose code matches exactly.
+
+    The finder also returns related variants (GR-270 also suggests GR-270/3SC),
+    so the product page slug and label are compared against the requested code
+    with all separators removed.
+    """
+    def compact(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    target = compact(code)
+    if not target:
+        return None, "empty Olympia code"
+
+    exact_slug = [p for p in products if compact(p["slug"]) == target]
+    slug_ends = [p for p in products if compact(p["slug"]).endswith(target)]
+    label_ends = [p for p in products if compact(p["label"]).endswith(target)]
+
+    for group in (exact_slug, slug_ends, label_ends):
+        if len(group) == 1:
+            return group[0], "matched product code"
+        if len(group) > 1:
+            return group[0], "matched product code (first of several)"
+
+    if products:
+        return None, (
+            "the content finder returned only related products: "
+            + ", ".join(p["label"] for p in products[:6])
+        )
+
+    return None, "the content finder returned no products for this code"
+
+
+def find_olympia_user_manual(product: dict) -> tuple[str, str]:
+    """Read an Olympia product page and return its User Manual PDF URL."""
+    url = urljoin(OLYMPIA_BASE_URL, product["path"])
+
+    response, error = olympia_request(
+        url, accept="text/html,*/*", referer=OLYMPIA_FINDER_URL
+    )
+
+    if response is None:
+        return "", error
+
+    if response.status_code != 200:
+        return "", f"HTTP {response.status_code} for {url}"
+
+    links = re.findall(
+        r'<a\s+href="([^"]+\.pdf)"[^>]*>\s*(.*?)</a>',
+        response.text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for href, text in links:
+        label = re.sub(r"<[^>]+>", " ", text)
+        if "user manual" in re.sub(r"\s+", " ", label).strip().lower():
+            return unescape(href), ""
+
+    labels = [re.sub(r"<[^>]+>", " ", t).strip() for _, t in links]
+    return "", (
+        "the product page has no 'User Manual' document"
+        + (f" (available: {', '.join(labels[:5])})" if labels else "")
+    )
+
+
+def download_olympia_datasheet(code: str) -> dict:
+    """Download the User Manual PDF for one Olympia Electronics code."""
+    search_code = re.sub(r"\s+", "", str(code or "")).strip("/")
+
+    if not search_code:
+        return {
+            "code": code,
+            "brand": "Olympia Electronics",
+            "success": False,
+            "url": OLYMPIA_FINDER_URL,
+            "error": "Empty Olympia Electronics code.",
+            "content": None,
+        }
+
+    products, error = search_olympia_products(search_code)
+
+    if not products and error:
+        return {
+            "code": code,
+            "brand": "Olympia Electronics",
+            "success": False,
+            "url": OLYMPIA_FINDER_URL,
+            "error": f"Olympia content finder search failed: {error}",
+            "content": None,
+        }
+
+    product, note = resolve_olympia_product(search_code, products)
+
+    if product is None:
+        return {
+            "code": code,
+            "brand": "Olympia Electronics",
+            "success": False,
+            "url": OLYMPIA_FINDER_URL,
+            "error": f"Could not find Olympia product '{search_code}': {note}",
+            "content": None,
+        }
+
+    product_url = urljoin(OLYMPIA_BASE_URL, product["path"])
+    pdf_url, error = find_olympia_user_manual(product)
+
+    if not pdf_url:
+        return {
+            "code": code,
+            "brand": "Olympia Electronics",
+            "success": False,
+            "url": product_url,
+            "error": f"Found Olympia product '{product['label']}' but {error}",
+            "content": None,
+        }
+
+    try:
+        response, request_error = olympia_request(
+            pdf_url, accept="application/pdf,*/*", referer=product_url
+        )
+
+        if response is None:
+            raise ValueError(request_error)
+
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+
+        content = response.content or b""
+        validate_pdf_content(content)
+
+        return {
+            "code": code,
+            "brand": "Olympia Electronics",
+            "success": True,
+            "url": pdf_url,
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "code": code,
+            "brand": "Olympia Electronics",
+            "success": False,
+            "url": pdf_url,
+            "error": (
+                f"Found Olympia product '{product['label']}' but the User Manual "
+                f"download failed: {e}"
+            ),
+            "content": None,
+        }
+
+
 def download_datasheet(code: str) -> dict:
     """Route product code to the correct vendor downloader."""
     product_type = get_product_type(code)
@@ -1752,6 +2001,8 @@ def download_datasheet(code: str) -> dict:
         return download_tecmar_datasheet(strip_product_prefix(code))
     if product_type == "lluria":
         return download_lluria_datasheet(strip_product_prefix(code))
+    if product_type == "olympia":
+        return download_olympia_datasheet(strip_product_prefix(code))
 
     return {
         "code": code,
@@ -1759,7 +2010,7 @@ def download_datasheet(code: str) -> dict:
         "success": False,
         "url": "",
         "error": (
-            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA or LLU. "
+            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA, LLU or OLY. "
             "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
         ),
         "content": None,
@@ -2065,6 +2316,7 @@ st.markdown(
         --fumagalli-green: #1E5B3A;
         --tecmar-red: #C72027;
         --lluria-navy: #14274E;
+        --olympia-blue: #005BAA;
         --app-bg: #F6F8FB;
         --card-bg: #FFFFFF;
         --text-main: #102033;
@@ -2173,6 +2425,19 @@ st.markdown(
         letter-spacing: 2px;
         line-height: 1;
         box-shadow: 0 8px 20px rgba(20, 39, 78, 0.14);
+    }
+
+    .olympia-logo {
+        background: var(--olympia-blue);
+        color: #ffffff;
+        border: 1px solid var(--olympia-blue);
+        border-radius: 4px;
+        padding: 9px 15px;
+        font-weight: 800;
+        font-size: 18px;
+        letter-spacing: 2px;
+        line-height: 1;
+        box-shadow: 0 8px 20px rgba(0, 91, 170, 0.18);
     }
 
     .brand-badge {
@@ -2413,8 +2678,10 @@ st.markdown(
         <div class="tecmar-logo">TEC-MAR</div>
         <div class="brand-divider"></div>
         <div class="lluria-logo">LLURIA</div>
+        <div class="brand-divider"></div>
+        <div class="olympia-logo">OLYMPIA</div>
     </div>
-    
+
 </div>
 
 <div class="hero">
@@ -2442,14 +2709,14 @@ with left_col:
         """
 <div class="tool-card">
     <div class="section-title">Paste product codes</div>
-    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis, TCMA for TEC-MAR article codes and LLU for LLURIA luminaire names.</div>
+    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis, TCMA for TEC-MAR article codes, LLU for LLURIA luminaire names and OLY for Olympia Electronics codes.</div>
 """,
         unsafe_allow_html=True,
     )
 
     manual_codes_text = st.text_area(
         "Product codes",
-        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102\nLLU-KAUS",
+        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102\nLLU-KAUS\nOLY-GR-2000",
         height=90,
         label_visibility="collapsed",
     )
@@ -2575,6 +2842,9 @@ lluria_count = len(
         or (i["kind"] == "code" and get_product_type(i["value"]) == "lluria")
     ]
 )
+olympia_count = len(
+    [i for i in all_items if i["kind"] == "code" and get_product_type(i["value"]) == "olympia"]
+)
 unknown_count = (
     len(all_items)
     - philips_count
@@ -2582,6 +2852,7 @@ unknown_count = (
     - fumagalli_count
     - tecmar_count
     - lluria_count
+    - olympia_count
 )
 
 st.markdown("### Summary before download")
@@ -2607,7 +2878,8 @@ with metric_4:
     brand_metric_4,
     brand_metric_5,
     brand_metric_6,
-) = st.columns(6)
+    brand_metric_7,
+) = st.columns(7)
 
 with brand_metric_1:
     st.metric("Philips", philips_count)
@@ -2625,6 +2897,9 @@ with brand_metric_5:
     st.metric("LLURIA", lluria_count)
 
 with brand_metric_6:
+    st.metric("Olympia", olympia_count)
+
+with brand_metric_7:
     st.metric("Unknown prefix", unknown_count)
 
 if all_items:
@@ -2711,6 +2986,9 @@ if all_items:
                         if matched_product
                         else f"No match ({match_note})"
                     )
+            elif product_type == "olympia":
+                brand = "Olympia Electronics"
+                matched = ""
             else:
                 brand = product_type.capitalize() if product_type != "unknown" else "Unknown"
                 matched = ""
@@ -2788,6 +3066,8 @@ if download_button:
                         brand = "Tec-Mar"
                     elif product_type == "lluria":
                         brand = "Lluria"
+                    elif product_type == "olympia":
+                        brand = "Olympia Electronics"
                     else:
                         brand = "Unknown"
 
