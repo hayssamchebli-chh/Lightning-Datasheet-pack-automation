@@ -116,6 +116,14 @@ FUMAGALLI_DOWNLOADS_URL = "https://www.fumagalli.it/en/downloads/"
 FUMAGALLI_CATALOG_TTL = 3600  # refresh the cached product list every hour
 FUMAGALLI_MAX_PAGES = 6
 
+# TEC-MAR products are published through the WordPress REST API. Every product
+# page links its "estratto catalogo" PDF, and all variants of one article
+# (same article code) share the same catalogue PDF.
+TECMAR_API_URL = "https://www.tec-mar.it/wp-json/wp/v2/prodotti"
+TECMAR_CATALOG_TTL = 3600
+TECMAR_MAX_PAGES = 30
+TECMAR_PAGE_SIZE = 100
+
 # Description words that never appear in Fumagalli catalogue names
 FUMAGALLI_NOISE_TOKENS = {
     "mod", "model", "cm", "mm", "d", "diam", "diameter", "h",
@@ -149,13 +157,17 @@ def get_product_type(code: str) -> str:
         return "philips"
     if code.startswith("ZMB"):
         return "zambelis"
+    if code.startswith("TEC"):
+        return "tecmar"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
-    """Remove PHL or ZMB prefix before searching vendor websites."""
-    if code.startswith(("PHL", "ZMB")):
-        cleaned = code[3:]
+    """Remove the brand prefix before searching vendor websites."""
+    for prefix in ("TECMAR", "TEC-MAR", "PHL", "ZMB", "TEC"):
+        if code.startswith(prefix):
+            cleaned = code[len(prefix):]
+            break
     else:
         cleaned = code
 
@@ -183,11 +195,13 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
 
     Expected columns (matched by name, falling back to column position):
     1. Type        - written on the cover page before the item's datasheet
-    2. Code        - PHL/ZMB codes search by code; FUM codes use the Description
-    3. Description - FUMAGALLI product name / full description
+    2. Code        - PHL/ZMB codes search by code; FUM codes use the
+                     Description; TEC codes use their article code when they
+                     carry one, otherwise the Description
+    3. Description - FUMAGALLI / TEC-MAR product name or full description
 
     Returns (items, error_message). Each item is a dict with:
-    kind ("code" or "fumagalli"), value (what to search), type, display.
+    kind ("code", "fumagalli" or "tecmar"), value (what to search), type, display.
     """
     uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file)
@@ -235,6 +249,22 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
                 {
                     "kind": "fumagalli",
                     "value": description,
+                    "type": type_text,
+                    "display": f"{code} - {description}" if description else code,
+                }
+            )
+        elif code.startswith("TEC"):
+            # TEC-MAR items are searched with the code and the Description
+            # together: the resolver uses the article code when the code
+            # carries a real one (TEC-6102) and falls back to the product
+            # name in the Description otherwise.
+            bare_code = strip_product_prefix(code)
+            search_value = f"{bare_code} {description}".strip()
+
+            items.append(
+                {
+                    "kind": "tecmar",
+                    "value": search_value,
                     "type": type_text,
                     "display": f"{code} - {description}" if description else code,
                 }
@@ -1250,6 +1280,240 @@ def download_fumagalli_datasheet(name: str) -> dict:
     return fetch_fumagalli_pdf(name, match)
 
 
+_TECMAR_CATALOG_CACHE: dict = {"timestamp": 0.0, "families": []}
+_TECMAR_CATALOG_LOCK = threading.Lock()
+
+TECMAR_SLUG_PATTERN = re.compile(r"^art-(\d+)-(.+)$")
+
+
+def fetch_tecmar_catalog() -> list[dict]:
+    """Fetch the TEC-MAR article list from the site's REST API (cached).
+
+    Product slugs look like "art-6102-togo-b-55-nl": the number is the article
+    code and every variant of that article shares one catalogue PDF. The list
+    is therefore collapsed to one entry per article code.
+    """
+    with _TECMAR_CATALOG_LOCK:
+        age = time.time() - _TECMAR_CATALOG_CACHE["timestamp"]
+        if _TECMAR_CATALOG_CACHE["families"] and age < TECMAR_CATALOG_TTL:
+            return _TECMAR_CATALOG_CACHE["families"]
+
+        families: dict[str, dict] = {}
+
+        for page in range(1, TECMAR_MAX_PAGES + 1):
+            try:
+                response = requests.get(
+                    TECMAR_API_URL,
+                    params={
+                        "per_page": TECMAR_PAGE_SIZE,
+                        "page": page,
+                        "_fields": "slug,title,link",
+                    },
+                    timeout=DEFAULT_TIMEOUT,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "Accept": "application/json",
+                    },
+                )
+            except Exception:
+                break
+
+            if response.status_code != 200:
+                break
+
+            try:
+                batch = response.json()
+            except Exception:
+                break
+
+            if not batch:
+                break
+
+            for product in batch:
+                slug = str(product.get("slug") or "")
+                match = TECMAR_SLUG_PATTERN.match(slug)
+                if not match:
+                    continue
+
+                code = match.group(1)
+                title = unescape(
+                    re.sub(r"<[^>]+>", "", (product.get("title") or {}).get("rendered", ""))
+                )
+                name = re.sub(r"\s+", " ", title.split("|")[0]).strip()
+
+                family = families.setdefault(
+                    code,
+                    {"code": code, "names": [], "link": product.get("link") or ""},
+                )
+                if name and name not in family["names"]:
+                    family["names"].append(name)
+
+            if len(batch) < TECMAR_PAGE_SIZE:
+                break
+
+        result = list(families.values())
+
+        if result:
+            _TECMAR_CATALOG_CACHE["families"] = result
+            _TECMAR_CATALOG_CACHE["timestamp"] = time.time()
+
+        return result
+
+
+def resolve_tecmar_family(query: str, families: list[dict]) -> tuple[dict | None, str]:
+    """Match an article code or a product name/description to one TEC-MAR family."""
+    query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query:
+        return None, "empty TEC-MAR code/description"
+
+    # An article code in the text is the most precise match ("TEC-6102", "6102").
+    for token in re.findall(r"\d{3,6}", query):
+        for family in families:
+            if family["code"] == token:
+                return family, f"matched article code {token}"
+
+    key = query.casefold()
+    tokens = set(fumagalli_tokens(query))
+
+    def name_variants(family: dict) -> list[str]:
+        return [n.casefold() for n in family["names"]]
+
+    exact = [f for f in families if key in name_variants(f)]
+    if len(exact) == 1:
+        return exact[0], "exact name match"
+    if len(exact) > 1:
+        return None, "ambiguous between article codes: " + ", ".join(f["code"] for f in exact)
+
+    # Otherwise score families by how much of their name the text contains.
+    scored = []
+    for family in families:
+        for name in family["names"]:
+            name_tokens = set(fumagalli_tokens(name))
+            if not name_tokens or not name_tokens <= tokens:
+                continue
+            scored.append((len(name_tokens), family, name))
+
+    if not scored:
+        return None, f"no TEC-MAR article matches '{query}'"
+
+    best_size = max(item[0] for item in scored)
+    best = [item for item in scored if item[0] == best_size]
+
+    unique_codes = {item[1]["code"] for item in best}
+    if len(unique_codes) == 1:
+        return best[0][1], f"matched product name '{best[0][2]}'"
+
+    return None, (
+        "description is not specific enough; matching articles: "
+        + ", ".join(f"{item[1]['code']} {item[2]}" for item in best[:6])
+    )
+
+
+def find_tecmar_catalog_pdf(family: dict) -> tuple[str, str]:
+    """Read a TEC-MAR product page and return its catalogue PDF URL."""
+    try:
+        response = requests.get(
+            family["link"],
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "text/html,*/*",
+            },
+        )
+    except Exception as e:
+        return "", str(e)
+
+    if response.status_code != 200:
+        return "", f"HTTP {response.status_code} for {family['link']}"
+
+    match = re.search(
+        r'href="([^"]*allegati/estratto-catalogo/[^"]+\.pdf)"',
+        response.text,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return "", "the product page has no 'estratto catalogo' PDF link"
+
+    return unescape(match.group(1)), ""
+
+
+def download_tecmar_datasheet(query: str) -> dict:
+    """Download the catalogue extract PDF for one TEC-MAR article."""
+    families = fetch_tecmar_catalog()
+
+    if not families:
+        return {
+            "code": query,
+            "brand": "Tec-Mar",
+            "success": False,
+            "url": TECMAR_API_URL,
+            "error": "Could not load the TEC-MAR product list from tec-mar.it.",
+            "content": None,
+        }
+
+    family, note = resolve_tecmar_family(query, families)
+
+    if family is None:
+        return {
+            "code": query,
+            "brand": "Tec-Mar",
+            "success": False,
+            "url": "https://www.tec-mar.it/",
+            "error": f"Could not match '{query}' to a TEC-MAR article: {note}",
+            "content": None,
+        }
+
+    pdf_url, error = find_tecmar_catalog_pdf(family)
+    family_label = f"{family['code']} {'/'.join(family['names'])}".strip()
+
+    if not pdf_url:
+        return {
+            "code": query,
+            "brand": "Tec-Mar",
+            "success": False,
+            "url": family["link"],
+            "error": f"Matched TEC-MAR article {family_label} but {error}",
+            "content": None,
+        }
+
+    try:
+        response = requests.get(
+            pdf_url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/pdf,*/*",
+                "Referer": family["link"],
+            },
+        )
+
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+
+        content = response.content or b""
+        validate_pdf_content(content)
+
+        return {
+            "code": query,
+            "brand": "Tec-Mar",
+            "success": True,
+            "url": pdf_url,
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "code": query,
+            "brand": "Tec-Mar",
+            "success": False,
+            "url": pdf_url,
+            "error": f"Matched TEC-MAR article {family_label} but the PDF download failed: {e}",
+            "content": None,
+        }
+
+
 def download_datasheet(code: str) -> dict:
     """Route product code to the correct vendor downloader."""
     product_type = get_product_type(code)
@@ -1258,6 +1522,8 @@ def download_datasheet(code: str) -> dict:
         return download_philips_datasheet(code)
     if product_type == "zambelis":
         return download_zambelis_datasheet(code)
+    if product_type == "tecmar":
+        return download_tecmar_datasheet(strip_product_prefix(code))
 
     return {
         "code": code,
@@ -1265,7 +1531,7 @@ def download_datasheet(code: str) -> dict:
         "success": False,
         "url": "",
         "error": (
-            "Unknown code prefix. Codes must start with PHL or ZMB. "
+            "Unknown code prefix. Codes must start with PHL, ZMB or TEC. "
             "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
         ),
         "content": None,
@@ -1569,6 +1835,7 @@ st.markdown(
         --zambelis-soft-gold: #F4E8CC;
         --zambelis-cream: #FAF7F0;
         --fumagalli-green: #1E5B3A;
+        --tecmar-red: #C72027;
         --app-bg: #F6F8FB;
         --card-bg: #FFFFFF;
         --text-main: #102033;
@@ -1651,6 +1918,19 @@ st.markdown(
         letter-spacing: 2px;
         line-height: 1;
         box-shadow: 0 8px 20px rgba(30, 91, 58, 0.14);
+    }
+
+    .tecmar-logo {
+        background: var(--tecmar-red);
+        color: #ffffff;
+        border: 1px solid var(--tecmar-red);
+        border-radius: 4px;
+        padding: 9px 15px;
+        font-weight: 800;
+        font-size: 18px;
+        letter-spacing: 2px;
+        line-height: 1;
+        box-shadow: 0 8px 20px rgba(199, 32, 39, 0.18);
     }
 
     .brand-badge {
@@ -1887,8 +2167,10 @@ st.markdown(
         <div class="zambelis-logo">ZAMBELIS</div>
         <div class="brand-divider"></div>
         <div class="fumagalli-logo">FUMAGALLI</div>
+        <div class="brand-divider"></div>
+        <div class="tecmar-logo">TEC-MAR</div>
     </div>
-    <div class="brand-badge">Philips, Zambelis &amp; FUMAGALLI Datasheet Automation</div>
+    <div class="brand-badge">Philips, Zambelis, FUMAGALLI &amp; TEC-MAR Datasheet Automation</div>
 </div>
 
 <div class="hero">
@@ -1916,14 +2198,14 @@ with left_col:
         """
 <div class="tool-card">
     <div class="section-title">Paste product codes</div>
-    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips and ZMB for Zambelis.</div>
+    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis and TEC for TEC-MAR article codes.</div>
 """,
         unsafe_allow_html=True,
     )
 
     manual_codes_text = st.text_area(
         "Product codes",
-        placeholder="Example:\nPHL046677568283\nZMB12345",
+        placeholder="Example:\nPHL046677568283\nZMB12345\nTEC-6102",
         height=90,
         label_visibility="collapsed",
     )
@@ -1954,7 +2236,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Columns: Type, Code, and Description. FUMAGALLI codes use the Description.</div>
+    <div class="section-subtitle">Columns: Type, Code, and Description. FUM codes use the Description; TEC codes use their article number, or the Description.</div>
 """,
         unsafe_allow_html=True,
     )
@@ -2033,7 +2315,17 @@ zambelis_count = len(
     [i for i in all_items if i["kind"] == "code" and get_product_type(i["value"]) == "zambelis"]
 )
 fumagalli_count = len([i for i in all_items if i["kind"] == "fumagalli"])
-unknown_count = len(all_items) - philips_count - zambelis_count - fumagalli_count
+tecmar_count = len(
+    [
+        i
+        for i in all_items
+        if i["kind"] == "tecmar"
+        or (i["kind"] == "code" and get_product_type(i["value"]) == "tecmar")
+    ]
+)
+unknown_count = (
+    len(all_items) - philips_count - zambelis_count - fumagalli_count - tecmar_count
+)
 
 st.markdown("### Summary before download")
 
@@ -2051,7 +2343,13 @@ with metric_3:
 with metric_4:
     st.metric("Total items", len(all_items))
 
-brand_metric_1, brand_metric_2, brand_metric_3, brand_metric_4 = st.columns(4)
+(
+    brand_metric_1,
+    brand_metric_2,
+    brand_metric_3,
+    brand_metric_4,
+    brand_metric_5,
+) = st.columns(5)
 
 with brand_metric_1:
     st.metric("Philips", philips_count)
@@ -2063,6 +2361,9 @@ with brand_metric_3:
     st.metric("FUMAGALLI", fumagalli_count)
 
 with brand_metric_4:
+    st.metric("TEC-MAR", tecmar_count)
+
+with brand_metric_5:
     st.metric("Unknown prefix", unknown_count)
 
 if all_items:
@@ -2076,8 +2377,24 @@ if all_items:
             except Exception:
                 catalog_preview = []
 
+        tecmar_items = [
+            i
+            for i in all_items
+            if i["kind"] == "tecmar"
+            or (i["kind"] == "code" and get_product_type(i["value"]) == "tecmar")
+        ]
+
+        tecmar_preview = []
+        if tecmar_items:
+            try:
+                tecmar_preview = fetch_tecmar_catalog()
+            except Exception:
+                tecmar_preview = []
+
         overview_rows = []
         for item in all_items:
+            product_type = get_product_type(item["value"]) if item["kind"] == "code" else ""
+
             if item["kind"] == "fumagalli":
                 brand = "FUMAGALLI"
                 matched = ""
@@ -2087,8 +2404,22 @@ if all_items:
                         catalog_preview,
                     )
                     matched = matched_product["name"] if matched_product else f"No match ({match_note})"
+            elif item["kind"] == "tecmar" or product_type == "tecmar":
+                brand = "TEC-MAR"
+                matched = ""
+                if tecmar_preview:
+                    search_value = (
+                        strip_product_prefix(item["value"])
+                        if item["kind"] == "code"
+                        else item["value"]
+                    )
+                    family, match_note = resolve_tecmar_family(search_value, tecmar_preview)
+                    matched = (
+                        f"{family['code']} {'/'.join(family['names'])}"
+                        if family
+                        else f"No match ({match_note})"
+                    )
             else:
-                product_type = get_product_type(item["value"])
                 brand = product_type.capitalize() if product_type != "unknown" else "Unknown"
                 matched = ""
 
@@ -2097,7 +2428,7 @@ if all_items:
                     "Item": item["display"],
                     "Brand": brand,
                     "Type (cover page)": item.get("type", ""),
-                    "Matched FUMAGALLI product": matched,
+                    "Matched product": matched,
                 }
             )
 
@@ -2130,6 +2461,8 @@ if download_button:
     def run_download_job(kind: str, value: str) -> dict:
         if kind == "fumagalli":
             return download_fumagalli_datasheet(value)
+        if kind == "tecmar":
+            return download_tecmar_datasheet(value)
         return download_datasheet(value)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -2147,12 +2480,16 @@ if download_button:
             except Exception as e:
                 if kind == "fumagalli":
                     brand = "Fumagalli"
+                elif kind == "tecmar":
+                    brand = "Tec-Mar"
                 else:
                     product_type = get_product_type(value)
                     if product_type == "philips":
                         brand = "Philips"
                     elif product_type == "zambelis":
                         brand = "Zambelis"
+                    elif product_type == "tecmar":
+                        brand = "Tec-Mar"
                     else:
                         brand = "Unknown"
 
