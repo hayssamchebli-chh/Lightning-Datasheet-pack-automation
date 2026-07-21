@@ -1974,8 +1974,148 @@ def find_olympia_user_manual(product: dict) -> tuple[str, str]:
     )
 
 
-def download_olympia_datasheet(code: str) -> dict:
-    """Download the User Manual PDF for one Olympia Electronics code."""
+def download_olympia_datasheet_browser(code: str) -> dict | None:
+    """Full Olympia flow inside a real browser (Playwright Chromium).
+
+    Used when the plain-requests flow gets filtered (hosting-provider IPs
+    receive empty finder results). A real browser session searches the
+    content finder, opens the matched product page and downloads the User
+    Manual through the browser's own HTTP client, which carries the same
+    fingerprint as a normal visitor. Returns None when Playwright is not
+    available so the caller can report the requests-path error instead.
+    """
+    if not PLAYWRIGHT_READY or _sync_playwright is None:
+        return None
+
+    def compact(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    target = compact(code)
+
+    try:
+        with _sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+            )
+
+            page = context.new_page()
+
+            try:
+                def find_products(query: str) -> list[dict]:
+                    page.goto(
+                        OLYMPIA_FINDER_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    page.fill('input[name="title"]', query, timeout=10_000)
+
+                    with page.expect_navigation(
+                        wait_until="domcontentloaded", timeout=30_000
+                    ):
+                        page.click('input[name="find"]', timeout=10_000)
+
+                    page.wait_for_timeout(800)
+                    return parse_olympia_product_links(page.content())
+
+                products = find_products(code)
+
+                product, note = resolve_olympia_product(code, products)
+
+                if product is None and "/" in code:
+                    base_products = find_products(code.split("/")[0])
+                    if base_products:
+                        product, note = resolve_olympia_product(code, base_products)
+
+                if product is None:
+                    return {
+                        "code": code,
+                        "brand": "Olympia Electronics",
+                        "success": False,
+                        "url": OLYMPIA_FINDER_URL,
+                        "error": f"Could not find Olympia product '{code}': {note}",
+                        "content": None,
+                    }
+
+                product_url = urljoin(OLYMPIA_BASE_URL, product["path"])
+                page.goto(product_url, wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(500)
+
+                links = re.findall(
+                    r'<a\s+href="([^"]+\.pdf)"[^>]*>(.*?)</a>',
+                    page.content(),
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+
+                pdf_url = ""
+                for href, text in links:
+                    label = re.sub(r"<[^>]+>", " ", text)
+                    if "user manual" in re.sub(r"\s+", " ", label).strip().lower():
+                        pdf_url = unescape(href)
+                        break
+
+                if not pdf_url:
+                    labels = [re.sub(r"<[^>]+>", " ", t).strip() for _, t in links]
+                    return {
+                        "code": code,
+                        "brand": "Olympia Electronics",
+                        "success": False,
+                        "url": product_url,
+                        "error": (
+                            f"Found Olympia product '{product['label']}' but the page "
+                            f"has no 'User Manual' document"
+                            + (f" (available: {', '.join(labels[:5])})" if labels else "")
+                        ),
+                        "content": None,
+                    }
+
+                response = context.request.get(
+                    pdf_url,
+                    headers={"Accept": "application/pdf,*/*", "Referer": product_url},
+                    timeout=30_000,
+                )
+
+                content = response.body() if response.ok else b""
+
+                if not response.ok:
+                    raise ValueError(f"HTTP {response.status}")
+
+                validate_pdf_content(content)
+
+                return {
+                    "code": code,
+                    "brand": "Olympia Electronics",
+                    "success": True,
+                    "url": pdf_url,
+                    "error": "",
+                    "content": content,
+                }
+
+            finally:
+                browser.close()
+
+    except Exception as e:
+        return {
+            "code": code,
+            "brand": "Olympia Electronics",
+            "success": False,
+            "url": OLYMPIA_FINDER_URL,
+            "error": f"Olympia browser lookup failed: {e}",
+            "content": None,
+        }
+
+
+def download_olympia_datasheet_requests(code: str) -> dict:
+    """Download the User Manual PDF for one Olympia code with plain requests."""
     search_code = re.sub(r"\s+", "", str(code or "")).strip("/")
 
     if not search_code:
@@ -2069,6 +2209,30 @@ def download_olympia_datasheet(code: str) -> dict:
             ),
             "content": None,
         }
+
+
+def download_olympia_datasheet(code: str) -> dict:
+    """Download the User Manual PDF for one Olympia Electronics code.
+
+    Plain requests first (fast). When that fails - hosting-provider IPs get
+    filtered by the Olympia site - the whole flow is retried inside a real
+    Playwright browser, which is indistinguishable from a normal visitor.
+    """
+    result = download_olympia_datasheet_requests(code)
+    if result["success"]:
+        return result
+
+    browser_result = download_olympia_datasheet_browser(code)
+
+    if browser_result is None:
+        return result
+
+    if not browser_result["success"]:
+        browser_result["error"] = (
+            f"{result['error']} | Browser retry: {browser_result['error']}"
+        )
+
+    return browser_result
 
 
 def download_datasheet(code: str) -> dict:
