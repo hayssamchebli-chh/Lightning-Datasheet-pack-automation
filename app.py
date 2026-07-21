@@ -2414,7 +2414,7 @@ st.markdown(
         <div class="brand-divider"></div>
         <div class="lluria-logo">LLURIA</div>
     </div>
-    <div class="brand-badge">Philips, Zambelis, FUMAGALLI, TEC-MAR &amp; LLURIA Datasheet Automation</div>
+    
 </div>
 
 <div class="hero">
