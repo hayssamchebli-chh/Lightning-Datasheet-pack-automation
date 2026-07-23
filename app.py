@@ -3431,7 +3431,7 @@ with brand_metric_7:
     st.metric("LEDLUZ", ledluz_count)
 
 with brand_metric_8:
-    st.metric("Unknown prefix", unknown_count)
+    st.metric("Unknown", unknown_count)
 
 if all_items:
     with st.expander("View detected items"):
