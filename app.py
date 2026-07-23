@@ -3268,8 +3268,8 @@ with right_col:
     uploaded_file = st.file_uploader(
         "Upload Excel file",
         type=["xlsx", "xls"],
-        label_visibility="collapsed",
         height=200,
+        label_visibility="collapsed",
     )
 
     st.markdown("</div>", unsafe_allow_html=True)
