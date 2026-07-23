@@ -3230,10 +3230,7 @@ with left_col:
 <div class="tool-card">
     <div class="section-title">Paste product codes</div>
     <div class="section-subtitle">
-        One item per line, each starting with its brand prefix:
-        PHL Philips, ZMB Zambelis, TCMA TEC-MAR article code, OLY Olympia Electronics,
-        LDZ LEDLUZ model code, LLU LLURIA luminaire name, FUM FUMAGALLI product name
-        or full description.
+        One item per line, each starting with its brand prefix.
     </div>
 """,
         unsafe_allow_html=True,
@@ -3263,7 +3260,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Columns: Type, Code, and Description. FUM and LLU codes use the Description; TCMA and LDZ codes use their model/article number, or the Description.</div>
+    <div class="section-subtitle">Columns: Type, Code, and Description. FUM and LLU codes use the Description.</div>
 """,
         unsafe_allow_html=True,
     )
