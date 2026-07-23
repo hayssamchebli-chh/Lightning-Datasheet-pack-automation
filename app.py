@@ -193,12 +193,14 @@ def get_product_type(code: str) -> str:
         return "olympia"
     if code.startswith("LDZ"):
         return "ledluz"
+    if code.startswith("FUM"):
+        return "fumagalli"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
     """Remove the brand prefix before searching vendor websites."""
-    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY", "LDZ"):
+    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY", "LDZ", "FUMAGALLI", "FUM"):
         if code.startswith(prefix):
             cleaned = code[len(prefix):]
             break
@@ -209,17 +211,31 @@ def strip_product_prefix(code: str) -> str:
 
 
 def extract_codes_from_text(text: str) -> list[str]:
-    """Extract product codes from manual text input."""
+    """Extract product codes from manual text input.
+
+    One entry per line. Codes may also be separated by commas, except for
+    FUM entries: those carry a FUMAGALLI product name or a full description
+    ("FUM-Mod. Abram 190 Grey 8.5W 3000K"), which can contain commas.
+    """
     if not text:
         return []
 
-    raw_items = re.split(r"[\n,;\t]+", text)
     codes = []
 
-    for item in raw_items:
-        code = normalize_code(item)
-        if code:
-            codes.append(code)
+    for line in re.split(r"[\n;\t]+", text):
+        line = line.strip()
+        if not line:
+            continue
+
+        if normalize_code(line).startswith("FUM"):
+            parts = [line]
+        else:
+            parts = line.split(",")
+
+        for part in parts:
+            code = normalize_code(part)
+            if code:
+                codes.append(code)
 
     return codes
 
@@ -350,36 +366,6 @@ def normalize_product_name(value: str) -> str:
     value = str(value).strip()
     value = re.sub(r"[^A-Za-z0-9 \-_\.&/]", "", value)
     return re.sub(r"\s+", " ", value).strip()
-
-
-def extract_names_from_text(text: str) -> list[str]:
-    """Extract FUMAGALLI product names from manual text input."""
-    if not text:
-        return []
-
-    raw_items = re.split(r"[\n;\t]+", text)
-    names = []
-
-    for item in raw_items:
-        name = normalize_product_name(item)
-        if name:
-            names.append(name)
-
-    return names
-
-
-def dedupe_names_preserve_order(items: list[str]) -> list[str]:
-    """Remove duplicate names case-insensitively, preserving first appearance."""
-    seen = set()
-    result = []
-
-    for item in items:
-        key = item.casefold()
-        if key not in seen:
-            seen.add(key)
-            result.append(item)
-
-    return result
 
 
 def drop_untyped_duplicates(items: list[dict]) -> list[dict]:
@@ -1930,16 +1916,21 @@ def fetch_ledluz_product_urls() -> list[str]:
     return urls
 
 
-def fetch_ledluz_catalog() -> list[dict]:
+def fetch_ledluz_catalog(allow_build: bool = True) -> list[dict]:
     """Build the LED-LUZ product index (name, model, datasheet), cached hourly.
 
-    Model codes are only shown on the product pages, so the pages are fetched
-    in parallel once and reused for an hour.
+    Model codes are only shown on the product pages, so every page is fetched
+    once and reused for an hour. Building takes about a minute, so callers
+    that must stay responsive (the on-screen preview) pass allow_build=False
+    to use the index only when it is already cached.
     """
     with _LEDLUZ_CATALOG_LOCK:
         age = time.time() - _LEDLUZ_CATALOG_CACHE["timestamp"]
         if _LEDLUZ_CATALOG_CACHE["products"] and age < LEDLUZ_CATALOG_TTL:
             return _LEDLUZ_CATALOG_CACHE["products"]
+
+        if not allow_build:
+            return []
 
         product_urls = fetch_ledluz_product_urls()
         if not product_urls:
@@ -2514,6 +2505,8 @@ def download_datasheet(code: str) -> dict:
         return download_olympia_datasheet(strip_product_prefix(code))
     if product_type == "ledluz":
         return download_ledluz_datasheet(strip_product_prefix(code))
+    if product_type == "fumagalli":
+        return download_fumagalli_datasheet(strip_product_prefix(code))
 
     return {
         "code": code,
@@ -3229,41 +3222,37 @@ st.markdown(
 # Input Section
 # ============================================================
 
-left_col, middle_col, right_col = st.columns([1, 1, 1], gap="large")
+left_col, right_col = st.columns([1, 1], gap="large")
 
 with left_col:
     st.markdown(
         """
 <div class="tool-card">
     <div class="section-title">Paste product codes</div>
-    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis, TCMA for TEC-MAR article codes, LLU for LLURIA luminaire names, OLY for Olympia Electronics codes and LDZ for LEDLUZ model codes.</div>
+    <div class="section-subtitle">
+        One item per line, each starting with its brand prefix:
+        PHL Philips, ZMB Zambelis, TCMA TEC-MAR article code, OLY Olympia Electronics,
+        LDZ LEDLUZ model code, LLU LLURIA luminaire name, FUM FUMAGALLI product name
+        or full description.
+    </div>
 """,
         unsafe_allow_html=True,
     )
 
     manual_codes_text = st.text_area(
         "Product codes",
-        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102\nLLU-KAUS\nOLY-GR-2000\nLDZ-ALP081-R",
-        height=90,
-        label_visibility="collapsed",
-    )
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with middle_col:
-    st.markdown(
-        """
-<div class="tool-card">
-    <div class="section-title">FUMAGALLI product names</div>
-    <div class="section-subtitle">Paste FUMAGALLI product names or full descriptions, one per line.</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-    fumagalli_names_text = st.text_area(
-        "FUMAGALLI product names",
-        placeholder="Example:\nCarlo\nMod. Abram 190 Grey 8.5W 3000K\nMod Livia D 6 CM Grey 1.7W 4000K",
-        height=90,
+        placeholder=(
+            "Example:\n"
+            "PHL046677568283\n"
+            "ZMB12345\n"
+            "TCMA-6102\n"
+            "OLY-GR-2000\n"
+            "LDZ-ALP081-R\n"
+            "LLU-KAUS\n"
+            "FUM-Carlo\n"
+            "FUM-Mod. Abram 190 Grey 8.5W 3000K"
+        ),
+        height=200,
         label_visibility="collapsed",
     )
 
@@ -3338,11 +3327,9 @@ st.markdown("</div>", unsafe_allow_html=True)
 # ============================================================
 
 manual_codes = dedupe_preserve_order(extract_codes_from_text(manual_codes_text))
-fumagalli_names = dedupe_names_preserve_order(extract_names_from_text(fumagalli_names_text))
 
 all_items = drop_untyped_duplicates(
     [{"kind": "code", "value": code, "type": "", "display": code} for code in manual_codes]
-    + [{"kind": "fumagalli", "value": name, "type": "", "display": name} for name in fumagalli_names]
     + excel_items
 )
 
@@ -3352,7 +3339,14 @@ philips_count = len(
 zambelis_count = len(
     [i for i in all_items if i["kind"] == "code" and get_product_type(i["value"]) == "zambelis"]
 )
-fumagalli_count = len([i for i in all_items if i["kind"] == "fumagalli"])
+fumagalli_count = len(
+    [
+        i
+        for i in all_items
+        if i["kind"] == "fumagalli"
+        or (i["kind"] == "code" and get_product_type(i["value"]) == "fumagalli")
+    ]
+)
 tecmar_count = len(
     [
         i
@@ -3393,18 +3387,15 @@ unknown_count = (
 
 st.markdown("### Summary before download")
 
-metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+metric_1, metric_2, metric_3 = st.columns(3)
 
 with metric_1:
-    st.metric("Manual codes", len(manual_codes))
+    st.metric("Pasted codes", len(manual_codes))
 
 with metric_2:
-    st.metric("FUMAGALLI names", len(fumagalli_names))
-
-with metric_3:
     st.metric("Excel items", len(excel_items))
 
-with metric_4:
+with metric_3:
     st.metric("Total items", len(all_items))
 
 (
@@ -3444,7 +3435,12 @@ with brand_metric_8:
 
 if all_items:
     with st.expander("View detected items"):
-        fumagalli_items = [i for i in all_items if i["kind"] == "fumagalli"]
+        fumagalli_items = [
+            i
+            for i in all_items
+            if i["kind"] == "fumagalli"
+            or (i["kind"] == "code" and get_product_type(i["value"]) == "fumagalli")
+        ]
 
         catalog_preview = []
         if fumagalli_items:
@@ -3491,7 +3487,10 @@ if all_items:
         ledluz_preview = []
         if ledluz_items:
             try:
-                ledluz_preview = fetch_ledluz_catalog()
+                # Only preview LEDLUZ matches when the index is already
+                # cached: building it takes about a minute and would block
+                # the page on every edit.
+                ledluz_preview = fetch_ledluz_catalog(allow_build=False)
             except Exception:
                 ledluz_preview = []
 
@@ -3499,12 +3498,17 @@ if all_items:
         for item in all_items:
             product_type = get_product_type(item["value"]) if item["kind"] == "code" else ""
 
-            if item["kind"] == "fumagalli":
+            if item["kind"] == "fumagalli" or product_type == "fumagalli":
                 brand = "FUMAGALLI"
                 matched = ""
                 if catalog_preview:
+                    search_value = (
+                        strip_product_prefix(item["value"])
+                        if item["kind"] == "code"
+                        else item["value"]
+                    )
                     matched_product, match_note = resolve_fumagalli_product(
-                        normalize_product_name(item["value"]),
+                        normalize_product_name(search_value),
                         catalog_preview,
                     )
                     matched = matched_product["name"] if matched_product else f"No match ({match_note})"
@@ -3560,6 +3564,8 @@ if all_items:
                         if matched_product
                         else f"No match ({match_note})"
                     )
+                else:
+                    matched = "Checked during download"
             else:
                 brand = product_type.capitalize() if product_type != "unknown" else "Unknown"
                 matched = ""
