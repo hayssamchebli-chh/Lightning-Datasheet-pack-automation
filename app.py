@@ -16,6 +16,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
 from pypdf.generic import Fit
 from reportlab.lib.colors import HexColor
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdf_canvas
 
 # ============================================================
@@ -143,6 +144,15 @@ LEDLUZ_CATALOG_TTL = 3600
 LEDLUZ_MAX_PAGES = 25
 LEDLUZ_INDEX_WORKERS = 16
 
+# Buckingham publishes no datasheet PDFs: every product page shows its
+# specification as HTML. The tool therefore builds a datasheet page from the
+# official product data (name, model, specification table and images).
+BUCKINGHAM_BASE_URL = "https://www.buckingham.com.tw"
+BUCKINGHAM_PRODUCTS_URL = BUCKINGHAM_BASE_URL + "/all/products"
+BUCKINGHAM_CATALOG_TTL = 3600
+BUCKINGHAM_INDEX_WORKERS = 12
+BUCKINGHAM_ACCENT_COLOR = "#0F2B46"
+
 # Olympia Electronics: the content finder autocomplete resolves a product code
 # to its product page, which links the "User Manual" PDF.
 OLYMPIA_BASE_URL = "https://www.olympia-electronics.com"
@@ -195,12 +205,14 @@ def get_product_type(code: str) -> str:
         return "ledluz"
     if code.startswith("FUM"):
         return "fumagalli"
+    if code.startswith("BUC"):
+        return "buckingham"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
     """Remove the brand prefix before searching vendor websites."""
-    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY", "LDZ", "FUMAGALLI", "FUM"):
+    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY", "LDZ", "BUC", "FUMAGALLI", "FUM"):
         if code.startswith(prefix):
             cleaned = code[len(prefix):]
             break
@@ -317,6 +329,19 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
                 {
                     "kind": "tecmar",
                     "value": search_value,
+                    "type": type_text,
+                    "display": f"{code} - {description}" if description else code,
+                }
+            )
+        elif code.startswith("BUC"):
+            # Buckingham items carry a model number (BUC-3P38212); the code
+            # and the Description are searched together so a row without a
+            # real model still resolves through its product name.
+            bare_code = strip_product_prefix(code)
+            items.append(
+                {
+                    "kind": "buckingham",
+                    "value": f"{bare_code} {description}".strip(),
                     "type": type_text,
                     "display": f"{code} - {description}" if description else code,
                 }
@@ -2081,6 +2106,466 @@ def download_ledluz_datasheet(query: str) -> dict:
         }
 
 
+_BUCKINGHAM_CATALOG_CACHE: dict = {"timestamp": 0.0, "products": []}
+_BUCKINGHAM_CATALOG_LOCK = threading.Lock()
+
+BUCKINGHAM_SPEC_ROW = re.compile(
+    r'<div class="col-lg-6 m-0 p-0">\s*([^<]{1,40}?)\s*</div>\s*'
+    r'<div class="col-lg-6 m-0 p-0 text-end">\s*(.*?)\s*</div>',
+    re.DOTALL,
+)
+
+
+def buckingham_get(url: str):
+    """GET a Buckingham page, returning the response or None."""
+    try:
+        response = requests.get(
+            url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,*/*",
+                "Accept-Language": "en",
+            },
+        )
+    except Exception:
+        return None
+
+    return response if response.status_code == 200 else None
+
+
+def clean_html_text(value: str) -> str:
+    """Strip tags/entities from a snippet of HTML and collapse whitespace."""
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return re.sub(r"\s+", " ", unescape(text)).strip()
+
+
+def to_pdf_text(value: str) -> str:
+    """Make text safe for the standard PDF fonts.
+
+    Buckingham separates alternatives with the CJK bar 丨, which Helvetica
+    cannot draw, and uses a few other non Latin-1 symbols.
+    """
+    text = str(value or "")
+    for source, target in (
+        ("丨", " | "), ("｜", " | "), ("·", "-"), ("–", "-"), ("—", "-"),
+        ("×", "x"), ("’", "'"), ("“", '"'), ("”", '"'), ("≥", ">="), ("≤", "<="),
+    ):
+        text = text.replace(source, target)
+
+    text = text.encode("latin-1", "ignore").decode("latin-1")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_buckingham_product_page(product_url: str, html: str) -> dict:
+    """Read one Buckingham product page into an index entry."""
+    name_match = re.search(r'<h1 class="fs-3">\s*(.*?)\s*</h1>', html, flags=re.DOTALL)
+    name = clean_html_text(name_match.group(1)) if name_match else ""
+
+    specs = []
+    for label, value in BUCKINGHAM_SPEC_ROW.findall(html):
+        label = clean_html_text(label)
+        value = clean_html_text(value)
+        if label:
+            specs.append((label, value))
+
+    model = ""
+    for label, value in specs:
+        if label.lower().startswith("model"):
+            model = value
+            break
+
+    def swiper_images(swiper_id: str) -> list[str]:
+        """Images of one carousel: product photos and dimension drawings live
+        in separate swipers, while colour swatches sit outside both."""
+        start = html.find(f'id="{swiper_id}"')
+        if start == -1:
+            return []
+        end = html.find("swiper-pagination", start)
+        block = html[start : end if end != -1 else start + 2000]
+        return [
+            urljoin(BUCKINGHAM_BASE_URL, unescape(src))
+            for src in re.findall(r'src="(/storage/[^"]+)"', block)
+        ]
+
+    images = swiper_images("product-swiper")
+    dimension_images = swiper_images("product-sizeimg-swiper")
+
+    categories = [
+        clean_html_text(c)
+        for c in re.findall(r'class="text-light-colour">\s*([^<]+?)\s*</a>', html)
+    ]
+
+    description = ""
+    body = re.search(r'<h1 class="fs-3">.*?</h1>(.*?)(?:Related Products|</body>)', html, re.DOTALL)
+    if body:
+        for line in clean_html_text(body.group(1)).split(". "):
+            line = line.strip()
+            if len(line) > 25 and not re.match(r"^(Model No|Colour|Dimensins)", line):
+                description = line if not description else f"{description}. {line}"
+            if len(description) > 300:
+                break
+
+    return {
+        "url": product_url,
+        "name": name,
+        "model": model,
+        "specs": specs,
+        "images": images,
+        "dimension_images": dimension_images,
+        "category": categories[-1] if categories else "",
+        "description": description[:300],
+    }
+
+
+def fetch_buckingham_catalog(allow_build: bool = True) -> list[dict]:
+    """Build the Buckingham product index, cached hourly.
+
+    Model numbers live on the product pages, so every page is fetched once in
+    parallel. Building takes a couple of minutes; callers that must stay
+    responsive pass allow_build=False to use the index only when cached.
+    """
+    with _BUCKINGHAM_CATALOG_LOCK:
+        age = time.time() - _BUCKINGHAM_CATALOG_CACHE["timestamp"]
+        if _BUCKINGHAM_CATALOG_CACHE["products"] and age < BUCKINGHAM_CATALOG_TTL:
+            return _BUCKINGHAM_CATALOG_CACHE["products"]
+
+        if not allow_build:
+            return []
+
+        listing = buckingham_get(BUCKINGHAM_PRODUCTS_URL)
+        if listing is None:
+            return []
+
+        ids = sorted(
+            set(re.findall(r'href="/product/(\d+)/detail"', listing.text)),
+            key=int,
+        )
+        if not ids:
+            return []
+
+        def load(product_id: str) -> dict | None:
+            url = f"{BUCKINGHAM_BASE_URL}/product/{product_id}/detail"
+            response = buckingham_get(url)
+            if response is None:
+                return None
+            entry = parse_buckingham_product_page(url, response.text)
+            return entry if (entry["model"] or entry["name"]) else None
+
+        products = []
+        with ThreadPoolExecutor(max_workers=BUCKINGHAM_INDEX_WORKERS) as executor:
+            for entry in executor.map(load, ids):
+                if entry:
+                    products.append(entry)
+
+        if products:
+            _BUCKINGHAM_CATALOG_CACHE["products"] = products
+            _BUCKINGHAM_CATALOG_CACHE["timestamp"] = time.time()
+
+        return products
+
+
+def resolve_buckingham_product(query: str, products: list[dict]) -> tuple[dict | None, str]:
+    """Match a model number or product name/description to one Buckingham product."""
+    query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query:
+        return None, "empty Buckingham code/description"
+
+    def compact(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    def model_variants(product: dict) -> list[str]:
+        # Some products list several models: "MT52201 | MT52202".
+        return [compact(part) for part in re.split(r"[丨|/,]", product["model"]) if part.strip()]
+
+    target = compact(query)
+
+    # 1. Model number, as the whole query or as a word inside a description.
+    candidates = [query] + [t for t in re.split(r"[\s,;]+", query) if t]
+    for candidate in candidates:
+        key = compact(candidate)
+        if len(key) < 3:
+            continue
+        matches = [p for p in products if key in model_variants(p)]
+        if matches:
+            note = f"matched model {matches[0]['model']}"
+            if len(matches) > 1:
+                note += " (first of several)"
+            return matches[0], note
+
+    # 2. Exact product name.
+    exact = [p for p in products if compact(p["name"]) == target]
+    if len(exact) == 1:
+        return exact[0], "exact name match"
+
+    # 3. Product whose name is fully contained in the query.
+    query_tokens = set(fumagalli_tokens(query))
+    scored = []
+    for product in products:
+        name_tokens = set(fumagalli_tokens(product["name"]))
+        if name_tokens and name_tokens <= query_tokens:
+            scored.append((len(name_tokens), product))
+
+    if scored:
+        best_size = max(size for size, _ in scored)
+        best = [product for size, product in scored if size == best_size]
+        if len(best) == 1:
+            return best[0], f"matched product name '{best[0]['name']}'"
+        return None, "ambiguous between: " + ", ".join(
+            p["model"] or p["name"] for p in best[:6]
+        )
+
+    return None, f"no Buckingham product matches '{query}'"
+
+
+def fetch_buckingham_image(url: str):
+    """Download one product image for the generated datasheet."""
+    try:
+        response = requests.get(
+            url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "image/*",
+                "Referer": BUCKINGHAM_BASE_URL,
+            },
+        )
+        if response.status_code != 200 or not response.content:
+            return None
+        return ImageReader(io.BytesIO(response.content))
+    except Exception:
+        return None
+
+
+def build_buckingham_datasheet(product: dict) -> bytes:
+    """Render a datasheet PDF from a Buckingham product page.
+
+    Buckingham does not publish datasheet PDFs, so this lays out the official
+    product data - name, model, specification table and product images - as a
+    single A4 page that can be merged into the pack like any other datasheet.
+    """
+    page_width, page_height = 595.276, 841.89
+    buffer = io.BytesIO()
+    sheet = pdf_canvas.Canvas(buffer, pagesize=(page_width, page_height))
+
+    accent = HexColor(BUCKINGHAM_ACCENT_COLOR)
+    muted = HexColor("#64748B")
+    line = HexColor("#DDE6F0")
+    margin = 48
+
+    # Header band
+    sheet.setFillColor(accent)
+    sheet.rect(0, page_height - 96, page_width, 96, stroke=0, fill=1)
+    sheet.setFillColor(HexColor("#FFFFFF"))
+    sheet.setFont("Helvetica-Bold", 24)
+    sheet.drawString(margin, page_height - 52, "BUCKINGHAM")
+    sheet.setFont("Helvetica", 10.5)
+    sheet.drawString(margin, page_height - 72, "Product specification")
+    if product.get("category"):
+        sheet.drawRightString(
+            page_width - margin, page_height - 72, to_pdf_text(product["category"])[:40]
+        )
+
+    y = page_height - 132
+
+    # Product name + model
+    sheet.setFillColor(HexColor("#102033"))
+    sheet.setFont("Helvetica-Bold", 20)
+    sheet.drawString(margin, y, to_pdf_text(product.get("name") or "Buckingham product")[:52])
+    y -= 22
+
+    if product.get("model"):
+        sheet.setFillColor(accent)
+        sheet.setFont("Helvetica-Bold", 12.5)
+        sheet.drawString(margin, y, f"Model No: {to_pdf_text(product['model'])[:48]}")
+        y -= 18
+
+    sheet.setStrokeColor(accent)
+    sheet.setLineWidth(2)
+    sheet.line(margin, y, margin + 60, y)
+    y -= 24
+
+    # Product image (left) and specification table (right)
+    image = None
+    for image_url in product.get("images", [])[:1]:
+        image = fetch_buckingham_image(image_url)
+        if image is not None:
+            break
+
+    table_x = margin
+    table_width = page_width - 2 * margin
+    top_of_block = y
+
+    if image is not None:
+        box = 200.0
+        try:
+            iw, ih = image.getSize()
+            scale = min(box / iw, box / ih)
+            draw_w, draw_h = iw * scale, ih * scale
+            sheet.drawImage(
+                image,
+                margin,
+                y - box + (box - draw_h) / 2,
+                width=draw_w,
+                height=draw_h,
+                mask="auto",
+                preserveAspectRatio=True,
+            )
+        except Exception:
+            image = None
+
+        if image is not None:
+            table_x = margin + box + 24
+            table_width = page_width - margin - table_x
+
+    # Specification rows
+    row_y = top_of_block
+    sheet.setFont("Helvetica-Bold", 11)
+    sheet.setFillColor(HexColor("#102033"))
+    sheet.drawString(table_x, row_y, "Specification")
+    row_y -= 16
+
+    for label, value in product.get("specs", [])[:14]:
+        if row_y < 150:
+            break
+
+        sheet.setStrokeColor(line)
+        sheet.setLineWidth(0.6)
+        sheet.line(table_x, row_y - 4, table_x + table_width, row_y - 4)
+
+        sheet.setFont("Helvetica", 9.5)
+        sheet.setFillColor(muted)
+        sheet.drawString(table_x, row_y, to_pdf_text(label)[:26])
+
+        sheet.setFont("Helvetica-Bold", 9.5)
+        sheet.setFillColor(HexColor("#102033"))
+        value_text = to_pdf_text(value)
+        while value_text and sheet.stringWidth(value_text, "Helvetica-Bold", 9.5) > table_width - 110:
+            value_text = value_text[:-1]
+        sheet.drawRightString(table_x + table_width, row_y, value_text)
+
+        row_y -= 17
+
+    y = min(row_y, top_of_block - 210) - 10
+
+    # Dimension drawings come from their own carousel on the product page
+    extra_images = product.get("dimension_images", [])[:2]
+    if extra_images and y > 190:
+        sheet.setFont("Helvetica-Bold", 11)
+        sheet.setFillColor(HexColor("#102033"))
+        sheet.drawString(margin, y, "Dimensions")
+        y -= 12
+
+        slot_w = (page_width - 2 * margin - 20) / max(len(extra_images), 1)
+        slot_h = min(230.0, y - 100)
+        drawn_any = False
+
+        for index, image_url in enumerate(extra_images):
+            drawing = fetch_buckingham_image(image_url)
+            if drawing is None:
+                continue
+            try:
+                iw, ih = drawing.getSize()
+                scale = min(slot_w / iw, slot_h / ih)
+                sheet.drawImage(
+                    drawing,
+                    margin + index * (slot_w + 20),
+                    y - slot_h,
+                    width=iw * scale,
+                    height=ih * scale,
+                    mask="auto",
+                    preserveAspectRatio=True,
+                )
+                drawn_any = True
+            except Exception:
+                continue
+
+        if drawn_any:
+            y -= slot_h + 16
+
+    # Footer: where the data came from
+    sheet.setStrokeColor(line)
+    sheet.setLineWidth(0.8)
+    sheet.line(margin, 74, page_width - margin, 74)
+    sheet.setFont("Helvetica", 8)
+    sheet.setFillColor(muted)
+    sheet.drawString(margin, 60, "Source: " + product.get("url", BUCKINGHAM_PRODUCTS_URL))
+    sheet.drawString(
+        margin,
+        48,
+        "Compiled from the official Buckingham product page on "
+        + time.strftime("%Y-%m-%d"),
+    )
+
+    sheet.showPage()
+    sheet.save()
+    return buffer.getvalue()
+
+
+def download_buckingham_datasheet(query: str) -> dict:
+    """Build the datasheet for one Buckingham product."""
+    search_value = re.sub(r"\s+", " ", str(query or "")).strip()
+
+    if not search_value:
+        return {
+            "code": query,
+            "brand": "Buckingham",
+            "success": False,
+            "url": BUCKINGHAM_PRODUCTS_URL,
+            "error": "Empty Buckingham code/description.",
+            "content": None,
+        }
+
+    products = fetch_buckingham_catalog()
+
+    if not products:
+        return {
+            "code": query,
+            "brand": "Buckingham",
+            "success": False,
+            "url": BUCKINGHAM_PRODUCTS_URL,
+            "error": "Could not load the Buckingham product list from buckingham.com.tw.",
+            "content": None,
+        }
+
+    product, note = resolve_buckingham_product(search_value, products)
+
+    if product is None:
+        return {
+            "code": query,
+            "brand": "Buckingham",
+            "success": False,
+            "url": BUCKINGHAM_PRODUCTS_URL,
+            "error": f"Could not match '{search_value}' to a Buckingham product: {note}",
+            "content": None,
+        }
+
+    label = product["model"] or product["name"]
+
+    try:
+        content = build_buckingham_datasheet(product)
+        validate_pdf_content(content)
+
+        return {
+            "code": query,
+            "brand": "Buckingham",
+            "success": True,
+            "url": product["url"],
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "code": query,
+            "brand": "Buckingham",
+            "success": False,
+            "url": product["url"],
+            "error": f"Matched Buckingham product '{label}' but the datasheet could not be built: {e}",
+            "content": None,
+        }
+
+
 def search_olympia_products(code: str) -> tuple[list[dict], str]:
     """Look a code up in the Olympia Electronics content finder.
 
@@ -2507,6 +2992,8 @@ def download_datasheet(code: str) -> dict:
         return download_ledluz_datasheet(strip_product_prefix(code))
     if product_type == "fumagalli":
         return download_fumagalli_datasheet(strip_product_prefix(code))
+    if product_type == "buckingham":
+        return download_buckingham_datasheet(strip_product_prefix(code))
 
     return {
         "code": code,
@@ -2514,7 +3001,7 @@ def download_datasheet(code: str) -> dict:
         "success": False,
         "url": "",
         "error": (
-            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA, LLU, OLY or LDZ. "
+            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA, LLU, OLY, LDZ or BUC. "
             "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
         ),
         "content": None,
@@ -2822,6 +3309,7 @@ st.markdown(
         --lluria-navy: #14274E;
         --olympia-blue: #005BAA;
         --ledluz-orange: #E67E22;
+        --buckingham-navy: #0F2B46;
         --app-bg: #F6F8FB;
         --card-bg: #FFFFFF;
         --text-main: #102033;
@@ -2943,6 +3431,19 @@ st.markdown(
         letter-spacing: 2px;
         line-height: 1;
         box-shadow: 0 8px 20px rgba(0, 91, 170, 0.18);
+    }
+
+    .buckingham-logo {
+        background: #ffffff;
+        color: var(--buckingham-navy);
+        border: 2px solid var(--buckingham-navy);
+        border-radius: 4px;
+        padding: 9px 15px;
+        font-weight: 800;
+        font-size: 17px;
+        letter-spacing: 1.5px;
+        line-height: 1;
+        box-shadow: 0 8px 20px rgba(15, 43, 70, 0.14);
     }
 
     .ledluz-logo {
@@ -3208,6 +3709,8 @@ st.markdown(
         <div class="olympia-logo">OLYMPIA</div>
         <div class="brand-divider"></div>
         <div class="ledluz-logo">LEDLUZ</div>
+        <div class="brand-divider"></div>
+        <div class="buckingham-logo">BUCKINGHAM</div>
     </div>
 
 </div>
@@ -3253,6 +3756,7 @@ with left_col:
             "TCMA-6102\n"
             "OLY-GR-2000\n"
             "LDZ-ALP081-R\n"
+            "BUC-3P38212\n"
             "LLU-KAUS\n"
             "FUM-Carlo\n"
             "FUM-Mod. Abram 190 Grey 8.5W 3000K"
@@ -3379,6 +3883,14 @@ ledluz_count = len(
         or (i["kind"] == "code" and get_product_type(i["value"]) == "ledluz")
     ]
 )
+buckingham_count = len(
+    [
+        i
+        for i in all_items
+        if i["kind"] == "buckingham"
+        or (i["kind"] == "code" and get_product_type(i["value"]) == "buckingham")
+    ]
+)
 unknown_count = (
     len(all_items)
     - philips_count
@@ -3388,6 +3900,7 @@ unknown_count = (
     - lluria_count
     - olympia_count
     - ledluz_count
+    - buckingham_count
 )
 
 st.markdown("### Summary before download")
@@ -3412,7 +3925,8 @@ with metric_3:
     brand_metric_6,
     brand_metric_7,
     brand_metric_8,
-) = st.columns(8)
+    brand_metric_9,
+) = st.columns(9)
 
 with brand_metric_1:
     st.metric("Philips", philips_count)
@@ -3436,6 +3950,9 @@ with brand_metric_7:
     st.metric("LEDLUZ", ledluz_count)
 
 with brand_metric_8:
+    st.metric("Buckingham", buckingham_count)
+
+with brand_metric_9:
     st.metric("Unknown", unknown_count)
 
 if all_items:
@@ -3488,6 +4005,22 @@ if all_items:
             if i["kind"] == "ledluz"
             or (i["kind"] == "code" and get_product_type(i["value"]) == "ledluz")
         ]
+
+        buckingham_items = [
+            i
+            for i in all_items
+            if i["kind"] == "buckingham"
+            or (i["kind"] == "code" and get_product_type(i["value"]) == "buckingham")
+        ]
+
+        buckingham_preview = []
+        if buckingham_items:
+            try:
+                # Same as LEDLUZ: only preview when the index is cached, the
+                # build takes minutes and would block the page on every edit.
+                buckingham_preview = fetch_buckingham_catalog(allow_build=False)
+            except Exception:
+                buckingham_preview = []
 
         ledluz_preview = []
         if ledluz_items:
@@ -3571,6 +4104,23 @@ if all_items:
                     )
                 else:
                     matched = "Checked during download"
+            elif item["kind"] == "buckingham" or product_type == "buckingham":
+                brand = "Buckingham"
+                matched = "Checked during download"
+                if buckingham_preview:
+                    search_value = (
+                        strip_product_prefix(item["value"])
+                        if item["kind"] == "code"
+                        else item["value"]
+                    )
+                    matched_product, match_note = resolve_buckingham_product(
+                        search_value, buckingham_preview
+                    )
+                    matched = (
+                        f"{matched_product['model']} - {matched_product['name']}"[:70]
+                        if matched_product
+                        else f"No match ({match_note})"
+                    )
             else:
                 brand = product_type.capitalize() if product_type != "unknown" else "Unknown"
                 matched = ""
@@ -3619,6 +4169,8 @@ if download_button:
             return download_lluria_datasheet(value)
         if kind == "ledluz":
             return download_ledluz_datasheet(value)
+        if kind == "buckingham":
+            return download_buckingham_datasheet(value)
         return download_datasheet(value)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -3642,6 +4194,8 @@ if download_button:
                     brand = "Lluria"
                 elif kind == "ledluz":
                     brand = "LEDLUZ"
+                elif kind == "buckingham":
+                    brand = "Buckingham"
                 else:
                     product_type = get_product_type(value)
                     if product_type == "philips":
@@ -3656,6 +4210,8 @@ if download_button:
                         brand = "Olympia Electronics"
                     elif product_type == "ledluz":
                         brand = "LEDLUZ"
+                    elif product_type == "buckingham":
+                        brand = "Buckingham"
                     else:
                         brand = "Unknown"
 
