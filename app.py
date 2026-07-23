@@ -3260,7 +3260,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Columns: Type, Code, and Description. FUM and LLU codes use the Description.</div>
+    <div class="section-subtitle">Columns: Type, Code, and Description.</div>
 """,
         unsafe_allow_html=True,
     )
