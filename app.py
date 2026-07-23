@@ -3105,6 +3105,14 @@ st.markdown(
         border-radius: 18px;
     }
 
+    /* Match the height of the product codes box next to it. */
+    .stFileUploader section,
+    .stFileUploader [data-testid="stFileUploaderDropzone"] {
+        min-height: 200px;
+        display: flex;
+        align-items: center;
+    }
+
     .stButton > button {
         background: linear-gradient(135deg, var(--philips-blue) 0%, var(--philips-deep-blue) 55%, var(--zambelis-black) 100%);
         color: white;
@@ -3268,7 +3276,6 @@ with right_col:
     uploaded_file = st.file_uploader(
         "Upload Excel file",
         type=["xlsx", "xls"],
-        height=200,
         label_visibility="collapsed",
     )
 
