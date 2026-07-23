@@ -82,11 +82,19 @@ if not PLAYWRIGHT_READY:
 MAX_WORKERS = 4
 DEFAULT_TIMEOUT = (8, 15)  # connect timeout, read timeout
 
+# Datasheet files are far bigger than the pages that link them (Zambelis
+# sheets run 1.7-3.4 MB), so downloading a PDF gets its own generous read
+# timeout and a retry: the short one made large files fail on slow links.
+PDF_TIMEOUT = (10, 90)
+PDF_DOWNLOAD_ATTEMPTS = 2
+
 ZAMBELIS_URL_PATTERNS = [
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet_{code}.pdf",
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet...%20{code}.pdf",
     "https://www.zambelislights.gr/image/catalog/sopranos/pdfs/Datasheet%20...%20{code}.pdf",
 ]
+
+ZAMBELIS_SEARCH_URL = "https://www.zambelislights.gr/index.php"
 
 SIGNIFY_SEARCH_API_URL = "https://api.microservices.signify.com/api/product/v1/smc/en_AA/search"
 
@@ -453,6 +461,50 @@ def validate_pdf_content(content: bytes) -> None:
     PdfReader(io.BytesIO(content))
 
 
+def fetch_pdf_bytes(url: str, referer: str = "") -> tuple[bytes, str]:
+    """Download a datasheet PDF, returning (content, error_message).
+
+    Uses the long PDF timeout and retries once, because vendor datasheets are
+    often several megabytes and a single slow transfer should not fail the
+    whole item.
+    """
+    last_error = "download failed"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/pdf,*/*",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    for attempt in range(1, PDF_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            response = requests.get(url, timeout=PDF_TIMEOUT, headers=headers, stream=True)
+
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                response.close()
+                if response.status_code == 404:
+                    return b"", last_error
+                continue
+
+            content = response.content or b""
+            response.close()
+
+            if not is_pdf_bytes(content):
+                content_type = response.headers.get("Content-Type", "")
+                return b"", f"Not a PDF. Content-Type: {content_type}"
+
+            return content, ""
+
+        except Exception as e:
+            last_error = str(e)
+            if attempt < PDF_DOWNLOAD_ATTEMPTS:
+                time.sleep(attempt)
+
+    return b"", last_error
+
+
 def download_philips_datasheet_api(code: str) -> dict | None:
     """Fast path: resolve a Philips code through the public Signify product API.
 
@@ -516,7 +568,7 @@ def download_philips_datasheet_api(code: str) -> dict | None:
         try:
             pdf_response = requests.get(
                 leaflet_url,
-                timeout=DEFAULT_TIMEOUT,
+                timeout=PDF_TIMEOUT,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Accept": "application/pdf,*/*",
@@ -984,57 +1036,114 @@ def download_philips_datasheet(code: str) -> dict:
             browser.close()
 
 
+def find_zambelis_datasheet_url(code: str) -> str:
+    """Find a Zambelis datasheet link by searching the shop for the code.
+
+    Used when none of the known filename patterns match: the product page
+    lists the real Datasheet/CE/Installation PDFs, so the datasheet link is
+    read from there instead of being guessed.
+    """
+    try:
+        search = requests.get(
+            ZAMBELIS_SEARCH_URL,
+            params={"route": "product/search", "search": code},
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,*/*",
+            },
+        )
+
+        if search.status_code != 200:
+            return ""
+
+        product_match = re.search(
+            r'class="name"[^>]*>\s*<a[^>]*href="([^"]+)"',
+            search.text,
+            flags=re.DOTALL,
+        )
+        if not product_match:
+            return ""
+
+        product = requests.get(
+            unescape(product_match.group(1)),
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,*/*",
+            },
+        )
+
+        if product.status_code != 200:
+            return ""
+
+        links = re.findall(r'href="([^"]*Datasheet[^"]*\.pdf)"', product.text, flags=re.IGNORECASE)
+        return unescape(links[0]) if links else ""
+
+    except Exception:
+        return ""
+
+
 def download_zambelis_datasheet(code: str) -> dict:
-    """Download one Zambelis datasheet."""
+    """Download one Zambelis datasheet.
+
+    The datasheets follow a stable filename pattern, so those URLs are tried
+    first (one request, no page parsing). If none match, the shop is searched
+    and the datasheet link is taken from the product page.
+    """
     search_code = strip_product_prefix(code)
     encoded_code = quote(search_code, safe="-_.")
 
     attempted_urls = []
     last_error = ""
 
+    def succeed(url: str, content: bytes) -> dict:
+        return {
+            "code": code,
+            "brand": "Zambelis",
+            "success": True,
+            "url": url,
+            "error": "",
+            "content": content,
+        }
+
     for pattern in ZAMBELIS_URL_PATTERNS:
         url = pattern.format(code=encoded_code)
         attempted_urls.append(url)
 
-        try:
-            response = requests.get(
-                url,
-                timeout=DEFAULT_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,*/*"},
-            )
+        content, error = fetch_pdf_bytes(url)
+        if content:
+            try:
+                validate_pdf_content(content)
+                return succeed(url, content)
+            except Exception as e:
+                last_error = str(e)
+        else:
+            last_error = error
 
-            content_type = response.headers.get("Content-Type", "").lower()
-            content = response.content or b""
-
-            if response.status_code != 200:
-                last_error = f"HTTP {response.status_code}"
-                continue
-
-            if "application/pdf" not in content_type and not is_pdf_bytes(content):
-                last_error = f"Not a PDF. Content-Type: {content_type}"
-                continue
-
-            validate_pdf_content(content)
-
-            return {
-                "code": code,
-                "brand": "Zambelis",
-                "success": True,
-                "url": url,
-                "error": "",
-                "content": content,
-            }
-
-        except Exception as e:
-            last_error = str(e)
-            continue
+    # Fall back to the link published on the product page.
+    page_url = find_zambelis_datasheet_url(search_code)
+    if page_url and page_url not in attempted_urls:
+        attempted_urls.append(page_url)
+        content, error = fetch_pdf_bytes(page_url)
+        if content:
+            try:
+                validate_pdf_content(content)
+                return succeed(page_url, content)
+            except Exception as e:
+                last_error = str(e)
+        else:
+            last_error = error
 
     return {
         "code": code,
         "brand": "Zambelis",
         "success": False,
         "url": " | ".join(attempted_urls),
-        "error": f"Not found after trying all 3 Zambelis links. Last error: {last_error}",
+        "error": (
+            f"No Zambelis datasheet could be downloaded for {search_code}. "
+            f"Last error: {last_error}"
+        ),
         "content": None,
     }
 
@@ -1238,7 +1347,7 @@ def fetch_fumagalli_pdf(display_name: str, product: dict) -> dict:
     try:
         response = requests.get(
             pdf_url,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=PDF_TIMEOUT,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Accept": "application/pdf,*/*",
@@ -1551,7 +1660,7 @@ def download_tecmar_datasheet(query: str) -> dict:
     try:
         response = requests.get(
             pdf_url,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=PDF_TIMEOUT,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Accept": "application/pdf,*/*",
@@ -1749,7 +1858,7 @@ def download_lluria_datasheet(query: str) -> dict:
     try:
         response = requests.get(
             pdf_url,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=PDF_TIMEOUT,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Accept": "application/pdf,*/*",
@@ -2072,7 +2181,7 @@ def download_ledluz_datasheet(query: str) -> dict:
     try:
         response = requests.get(
             product["datasheet"],
-            timeout=DEFAULT_TIMEOUT,
+            timeout=PDF_TIMEOUT,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Accept": "application/pdf,*/*",
