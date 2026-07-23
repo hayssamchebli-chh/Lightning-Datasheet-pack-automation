@@ -3269,6 +3269,7 @@ with right_col:
         "Upload Excel file",
         type=["xlsx", "xls"],
         label_visibility="collapsed",
+        height=200,
     )
 
     st.markdown("</div>", unsafe_allow_html=True)
