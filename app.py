@@ -133,6 +133,16 @@ LLURIA_MAX_PAGES = 6
 LLURIA_PAGE_SIZE = 100
 LLURIA_PDF_FALLBACK = "https://lluria.com/store/wp-content/uploads/FT/LUMINARIAS/F.T.{name}.pdf"
 
+# LED-LUZ (LEDLUZ) publishes one specification PDF per product page. Products
+# are listed at /products (paginated) and carry a model code such as ALP081-R.
+# The site search only matches product names, so model codes are resolved
+# through a cached index built from the product pages.
+LEDLUZ_BASE_URL = "https://www.led-luz.com"
+LEDLUZ_PRODUCTS_URL = LEDLUZ_BASE_URL + "/products"
+LEDLUZ_CATALOG_TTL = 3600
+LEDLUZ_MAX_PAGES = 25
+LEDLUZ_INDEX_WORKERS = 16
+
 # Olympia Electronics: the content finder autocomplete resolves a product code
 # to its product page, which links the "User Manual" PDF.
 OLYMPIA_BASE_URL = "https://www.olympia-electronics.com"
@@ -181,12 +191,14 @@ def get_product_type(code: str) -> str:
         return "lluria"
     if code.startswith("OLY"):
         return "olympia"
+    if code.startswith("LDZ"):
+        return "ledluz"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
     """Remove the brand prefix before searching vendor websites."""
-    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY"):
+    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY", "LDZ"):
         if code.startswith(prefix):
             cleaned = code[len(prefix):]
             break
@@ -289,6 +301,19 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
                 {
                     "kind": "tecmar",
                     "value": search_value,
+                    "type": type_text,
+                    "display": f"{code} - {description}" if description else code,
+                }
+            )
+        elif code.startswith("LDZ"):
+            # LEDLUZ items carry a model code (LDZ-ALP081-R). The code and the
+            # Description are searched together so a row without a real model
+            # still resolves through its product name.
+            bare_code = strip_product_prefix(code)
+            items.append(
+                {
+                    "kind": "ledluz",
+                    "value": f"{bare_code} {description}".strip(),
                     "type": type_text,
                     "display": f"{code} - {description}" if description else code,
                 }
@@ -1827,6 +1852,244 @@ def parse_olympia_product_links(html: str) -> list[dict]:
     return products
 
 
+_LEDLUZ_CATALOG_CACHE: dict = {"timestamp": 0.0, "products": []}
+_LEDLUZ_CATALOG_LOCK = threading.Lock()
+
+LEDLUZ_MODEL_PATTERN = re.compile(
+    r'<div class="label">\s*Model:\s*</div>\s*<div class="value">\s*([^<]+?)\s*</div>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def ledluz_get(url: str, params: dict | None = None):
+    """GET a LED-LUZ page, returning the response or None."""
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,*/*",
+                "Accept-Language": "en",
+            },
+        )
+    except Exception:
+        return None
+
+    return response if response.status_code == 200 else None
+
+
+def parse_ledluz_product_page(product_url: str, html: str) -> dict:
+    """Read one LED-LUZ product page into an index entry."""
+    title_match = re.search(r"<title>(.*?)</title>", html, flags=re.DOTALL)
+    name = ""
+    if title_match:
+        name = re.sub(r"\s+", " ", unescape(title_match.group(1))).strip()
+        name = re.sub(r"\s*[-|]\s*LEDLUZ\s*$", "", name, flags=re.IGNORECASE).strip()
+
+    model_match = LEDLUZ_MODEL_PATTERN.search(html)
+    model = unescape(model_match.group(1)).strip() if model_match else ""
+
+    # The specification PDF is the download button inside the product's
+    # "btns" block; other PDFs on the page are the general catalogues.
+    datasheet = ""
+    buttons = re.search(r'class="[^"]*btns[^"]*"(.*?)</div>', html, flags=re.DOTALL)
+    if buttons:
+        pdf_match = re.search(r'href="([^"]+\.pdf)"', buttons.group(1), flags=re.IGNORECASE)
+        if pdf_match:
+            datasheet = unescape(pdf_match.group(1))
+
+    return {"url": product_url, "name": name, "model": model, "datasheet": datasheet}
+
+
+def fetch_ledluz_product_urls() -> list[str]:
+    """Collect every product URL from the paginated LED-LUZ product listing."""
+    urls = []
+    seen = set()
+
+    for page in range(1, LEDLUZ_MAX_PAGES + 1):
+        response = ledluz_get(LEDLUZ_PRODUCTS_URL, params={"page": page})
+        if response is None:
+            break
+
+        found = re.findall(r'href="(https://www\.led-luz\.com/products/\d+)"', response.text)
+        if not found:
+            break
+
+        new_on_page = 0
+        for url in found:
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+                new_on_page += 1
+
+        if new_on_page == 0:
+            break
+
+    return urls
+
+
+def fetch_ledluz_catalog() -> list[dict]:
+    """Build the LED-LUZ product index (name, model, datasheet), cached hourly.
+
+    Model codes are only shown on the product pages, so the pages are fetched
+    in parallel once and reused for an hour.
+    """
+    with _LEDLUZ_CATALOG_LOCK:
+        age = time.time() - _LEDLUZ_CATALOG_CACHE["timestamp"]
+        if _LEDLUZ_CATALOG_CACHE["products"] and age < LEDLUZ_CATALOG_TTL:
+            return _LEDLUZ_CATALOG_CACHE["products"]
+
+        product_urls = fetch_ledluz_product_urls()
+        if not product_urls:
+            return []
+
+        def load(product_url: str) -> dict | None:
+            response = ledluz_get(product_url)
+            if response is None:
+                return None
+            return parse_ledluz_product_page(product_url, response.text)
+
+        products = []
+        with ThreadPoolExecutor(max_workers=LEDLUZ_INDEX_WORKERS) as executor:
+            for entry in executor.map(load, product_urls):
+                if entry and (entry["model"] or entry["name"]):
+                    products.append(entry)
+
+        if products:
+            _LEDLUZ_CATALOG_CACHE["products"] = products
+            _LEDLUZ_CATALOG_CACHE["timestamp"] = time.time()
+
+        return products
+
+
+def resolve_ledluz_product(query: str, products: list[dict]) -> tuple[dict | None, str]:
+    """Match a model code or a product name/description to one LED-LUZ product."""
+    query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query:
+        return None, "empty LEDLUZ code/description"
+
+    def compact(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+    usable = [p for p in products if p["datasheet"]]
+    if not usable:
+        return None, "no LEDLUZ products with a specification PDF were found"
+
+    # 1. Model code, either as the whole query or as a word inside it.
+    tokens = [t for t in re.split(r"[\s,;]+", query) if t]
+    for candidate in [query] + tokens:
+        target = compact(candidate)
+        if len(target) < 4:
+            continue
+        matches = [p for p in usable if compact(p["model"]) == target]
+        if len(matches) == 1:
+            return matches[0], f"matched model {matches[0]['model']}"
+        if len(matches) > 1:
+            return matches[0], f"matched model {matches[0]['model']} (first of several)"
+
+    # 2. Exact product name.
+    key = query.casefold()
+    exact = [p for p in usable if p["name"].casefold() == key]
+    if len(exact) == 1:
+        return exact[0], "exact name match"
+
+    # 3. Otherwise the product whose name is best covered by the query.
+    query_tokens = set(fumagalli_tokens(query))
+    scored = []
+    for product in usable:
+        name_tokens = set(fumagalli_tokens(product["name"]))
+        if name_tokens and name_tokens <= query_tokens:
+            scored.append((len(name_tokens), product))
+
+    if scored:
+        best_size = max(size for size, _ in scored)
+        best = [product for size, product in scored if size == best_size]
+        if len(best) == 1:
+            return best[0], f"matched product name '{best[0]['name']}'"
+        return None, "ambiguous between: " + ", ".join(p["model"] or p["name"] for p in best[:6])
+
+    return None, f"no LEDLUZ product matches '{query}'"
+
+
+def download_ledluz_datasheet(query: str) -> dict:
+    """Download the specification PDF for one LEDLUZ product."""
+    search_value = re.sub(r"\s+", " ", str(query or "")).strip()
+
+    if not search_value:
+        return {
+            "code": query,
+            "brand": "LEDLUZ",
+            "success": False,
+            "url": LEDLUZ_PRODUCTS_URL,
+            "error": "Empty LEDLUZ code/description.",
+            "content": None,
+        }
+
+    products = fetch_ledluz_catalog()
+
+    if not products:
+        return {
+            "code": query,
+            "brand": "LEDLUZ",
+            "success": False,
+            "url": LEDLUZ_PRODUCTS_URL,
+            "error": "Could not load the LEDLUZ product list from led-luz.com.",
+            "content": None,
+        }
+
+    product, note = resolve_ledluz_product(search_value, products)
+
+    if product is None:
+        return {
+            "code": query,
+            "brand": "LEDLUZ",
+            "success": False,
+            "url": LEDLUZ_PRODUCTS_URL,
+            "error": f"Could not match '{search_value}' to a LEDLUZ product: {note}",
+            "content": None,
+        }
+
+    label = product["model"] or product["name"]
+
+    try:
+        response = requests.get(
+            product["datasheet"],
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/pdf,*/*",
+                "Referer": product["url"],
+            },
+        )
+
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}")
+
+        content = response.content or b""
+        validate_pdf_content(content)
+
+        return {
+            "code": query,
+            "brand": "LEDLUZ",
+            "success": True,
+            "url": product["datasheet"],
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "code": query,
+            "brand": "LEDLUZ",
+            "success": False,
+            "url": product["datasheet"],
+            "error": f"Matched LEDLUZ product '{label}' but the PDF download failed: {e}",
+            "content": None,
+        }
+
+
 def search_olympia_products(code: str) -> tuple[list[dict], str]:
     """Look a code up in the Olympia Electronics content finder.
 
@@ -2249,6 +2512,8 @@ def download_datasheet(code: str) -> dict:
         return download_lluria_datasheet(strip_product_prefix(code))
     if product_type == "olympia":
         return download_olympia_datasheet(strip_product_prefix(code))
+    if product_type == "ledluz":
+        return download_ledluz_datasheet(strip_product_prefix(code))
 
     return {
         "code": code,
@@ -2256,7 +2521,7 @@ def download_datasheet(code: str) -> dict:
         "success": False,
         "url": "",
         "error": (
-            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA, LLU or OLY. "
+            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA, LLU, OLY or LDZ. "
             "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
         ),
         "content": None,
@@ -2563,6 +2828,7 @@ st.markdown(
         --tecmar-red: #C72027;
         --lluria-navy: #14274E;
         --olympia-blue: #005BAA;
+        --ledluz-orange: #E67E22;
         --app-bg: #F6F8FB;
         --card-bg: #FFFFFF;
         --text-main: #102033;
@@ -2684,6 +2950,19 @@ st.markdown(
         letter-spacing: 2px;
         line-height: 1;
         box-shadow: 0 8px 20px rgba(0, 91, 170, 0.18);
+    }
+
+    .ledluz-logo {
+        background: var(--ledluz-orange);
+        color: #ffffff;
+        border: 1px solid var(--ledluz-orange);
+        border-radius: 999px;
+        padding: 9px 16px;
+        font-weight: 800;
+        font-size: 18px;
+        letter-spacing: 2px;
+        line-height: 1;
+        box-shadow: 0 8px 20px rgba(230, 126, 34, 0.18);
     }
 
     .brand-badge {
@@ -2926,6 +3205,8 @@ st.markdown(
         <div class="lluria-logo">LLURIA</div>
         <div class="brand-divider"></div>
         <div class="olympia-logo">OLYMPIA</div>
+        <div class="brand-divider"></div>
+        <div class="ledluz-logo">LEDLUZ</div>
     </div>
 
 </div>
@@ -2955,14 +3236,14 @@ with left_col:
         """
 <div class="tool-card">
     <div class="section-title">Paste product codes</div>
-    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis, TCMA for TEC-MAR article codes, LLU for LLURIA luminaire names and OLY for Olympia Electronics codes.</div>
+    <div class="section-subtitle">Add one or multiple product codes. Use PHL for Philips, ZMB for Zambelis, TCMA for TEC-MAR article codes, LLU for LLURIA luminaire names, OLY for Olympia Electronics codes and LDZ for LEDLUZ model codes.</div>
 """,
         unsafe_allow_html=True,
     )
 
     manual_codes_text = st.text_area(
         "Product codes",
-        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102\nLLU-KAUS\nOLY-GR-2000",
+        placeholder="Example:\nPHL046677568283\nZMB12345\nTCMA-6102\nLLU-KAUS\nOLY-GR-2000\nLDZ-ALP081-R",
         height=90,
         label_visibility="collapsed",
     )
@@ -2993,7 +3274,7 @@ with right_col:
         """
 <div class="tool-card">
     <div class="section-title">Upload Excel file</div>
-    <div class="section-subtitle">Columns: Type, Code, and Description. FUM and LLU codes use the Description; TCMA codes use their article number, or the Description.</div>
+    <div class="section-subtitle">Columns: Type, Code, and Description. FUM and LLU codes use the Description; TCMA and LDZ codes use their model/article number, or the Description.</div>
 """,
         unsafe_allow_html=True,
     )
@@ -3091,6 +3372,14 @@ lluria_count = len(
 olympia_count = len(
     [i for i in all_items if i["kind"] == "code" and get_product_type(i["value"]) == "olympia"]
 )
+ledluz_count = len(
+    [
+        i
+        for i in all_items
+        if i["kind"] == "ledluz"
+        or (i["kind"] == "code" and get_product_type(i["value"]) == "ledluz")
+    ]
+)
 unknown_count = (
     len(all_items)
     - philips_count
@@ -3099,6 +3388,7 @@ unknown_count = (
     - tecmar_count
     - lluria_count
     - olympia_count
+    - ledluz_count
 )
 
 st.markdown("### Summary before download")
@@ -3125,7 +3415,8 @@ with metric_4:
     brand_metric_5,
     brand_metric_6,
     brand_metric_7,
-) = st.columns(7)
+    brand_metric_8,
+) = st.columns(8)
 
 with brand_metric_1:
     st.metric("Philips", philips_count)
@@ -3146,6 +3437,9 @@ with brand_metric_6:
     st.metric("Olympia", olympia_count)
 
 with brand_metric_7:
+    st.metric("LEDLUZ", ledluz_count)
+
+with brand_metric_8:
     st.metric("Unknown prefix", unknown_count)
 
 if all_items:
@@ -3186,6 +3480,20 @@ if all_items:
                 lluria_preview = fetch_lluria_catalog()
             except Exception:
                 lluria_preview = []
+
+        ledluz_items = [
+            i
+            for i in all_items
+            if i["kind"] == "ledluz"
+            or (i["kind"] == "code" and get_product_type(i["value"]) == "ledluz")
+        ]
+
+        ledluz_preview = []
+        if ledluz_items:
+            try:
+                ledluz_preview = fetch_ledluz_catalog()
+            except Exception:
+                ledluz_preview = []
 
         overview_rows = []
         for item in all_items:
@@ -3235,6 +3543,23 @@ if all_items:
             elif product_type == "olympia":
                 brand = "Olympia Electronics"
                 matched = ""
+            elif item["kind"] == "ledluz" or product_type == "ledluz":
+                brand = "LEDLUZ"
+                matched = ""
+                if ledluz_preview:
+                    search_value = (
+                        strip_product_prefix(item["value"])
+                        if item["kind"] == "code"
+                        else item["value"]
+                    )
+                    matched_product, match_note = resolve_ledluz_product(
+                        search_value, ledluz_preview
+                    )
+                    matched = (
+                        f"{matched_product['model']} - {matched_product['name']}"[:70]
+                        if matched_product
+                        else f"No match ({match_note})"
+                    )
             else:
                 brand = product_type.capitalize() if product_type != "unknown" else "Unknown"
                 matched = ""
@@ -3281,6 +3606,8 @@ if download_button:
             return download_tecmar_datasheet(value)
         if kind == "lluria":
             return download_lluria_datasheet(value)
+        if kind == "ledluz":
+            return download_ledluz_datasheet(value)
         return download_datasheet(value)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -3302,6 +3629,8 @@ if download_button:
                     brand = "Tec-Mar"
                 elif kind == "lluria":
                     brand = "Lluria"
+                elif kind == "ledluz":
+                    brand = "LEDLUZ"
                 else:
                     product_type = get_product_type(value)
                     if product_type == "philips":
@@ -3314,6 +3643,8 @@ if download_button:
                         brand = "Lluria"
                     elif product_type == "olympia":
                         brand = "Olympia Electronics"
+                    elif product_type == "ledluz":
+                        brand = "LEDLUZ"
                     else:
                         brand = "Unknown"
 
