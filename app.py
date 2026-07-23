@@ -161,6 +161,15 @@ BUCKINGHAM_CATALOG_TTL = 3600
 BUCKINGHAM_INDEX_WORKERS = 12
 BUCKINGHAM_ACCENT_COLOR = "#0F2B46"
 
+# Belite (vtop-led.com) publishes no per-product datasheet PDFs either: the
+# only PDFs on the site are category certificates. Product pages carry the
+# full specification, so the datasheet is built from that, like Buckingham.
+BELITE_BASE_URL = "https://www.vtop-led.com"
+BELITE_PRODUCTS_URL = BELITE_BASE_URL + "/products/"
+BELITE_CATALOG_TTL = 3600
+BELITE_INDEX_WORKERS = 12
+BELITE_ACCENT_COLOR = "#1B7A3E"
+
 # Olympia Electronics: the content finder autocomplete resolves a product code
 # to its product page, which links the "User Manual" PDF.
 OLYMPIA_BASE_URL = "https://www.olympia-electronics.com"
@@ -215,12 +224,14 @@ def get_product_type(code: str) -> str:
         return "fumagalli"
     if code.startswith("BUC"):
         return "buckingham"
+    if code.startswith("BLT"):
+        return "belite"
     return "unknown"
 
 
 def strip_product_prefix(code: str) -> str:
     """Remove the brand prefix before searching vendor websites."""
-    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY", "LDZ", "BUC", "FUMAGALLI", "FUM"):
+    for prefix in ("TCMA", "PHL", "ZMB", "LLU", "OLY", "LDZ", "BUC", "BLT", "FUMAGALLI", "FUM"):
         if code.startswith(prefix):
             cleaned = code[len(prefix):]
             break
@@ -337,6 +348,17 @@ def extract_items_from_excel(uploaded_file) -> tuple[list[dict], str]:
                 {
                     "kind": "tecmar",
                     "value": search_value,
+                    "type": type_text,
+                    "display": f"{code} - {description}" if description else code,
+                }
+            )
+        elif code.startswith("BLT"):
+            # BELITE publishes no item codes, so the Description carries the
+            # product name; the code is only a reference for the pack.
+            items.append(
+                {
+                    "kind": "belite",
+                    "value": description or strip_product_prefix(code),
                     "type": type_text,
                     "display": f"{code} - {description}" if description else code,
                 }
@@ -2427,18 +2449,21 @@ def resolve_buckingham_product(query: str, products: list[dict]) -> tuple[dict |
     return None, f"no Buckingham product matches '{query}'"
 
 
-def fetch_buckingham_image(url: str):
-    """Download one product image for the generated datasheet."""
+def fetch_product_image(url: str, referer: str = ""):
+    """Download one product image for a generated datasheet.
+
+    The referer must match the image's own site: sending another vendor's
+    referer makes some hosts stall until the request times out.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "image/*",
+    }
+    if referer:
+        headers["Referer"] = referer
+
     try:
-        response = requests.get(
-            url,
-            timeout=DEFAULT_TIMEOUT,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "image/*",
-                "Referer": BUCKINGHAM_BASE_URL,
-            },
-        )
+        response = requests.get(url, timeout=DEFAULT_TIMEOUT, headers=headers)
         if response.status_code != 200 or not response.content:
             return None
         return ImageReader(io.BytesIO(response.content))
@@ -2497,7 +2522,7 @@ def build_buckingham_datasheet(product: dict) -> bytes:
     # Product image (left) and specification table (right)
     image = None
     for image_url in product.get("images", [])[:1]:
-        image = fetch_buckingham_image(image_url)
+        image = fetch_product_image(image_url, BUCKINGHAM_BASE_URL)
         if image is not None:
             break
 
@@ -2570,7 +2595,7 @@ def build_buckingham_datasheet(product: dict) -> bytes:
         drawn_any = False
 
         for index, image_url in enumerate(extra_images):
-            drawing = fetch_buckingham_image(image_url)
+            drawing = fetch_product_image(image_url, BUCKINGHAM_BASE_URL)
             if drawing is None:
                 continue
             try:
@@ -2671,6 +2696,351 @@ def download_buckingham_datasheet(query: str) -> dict:
             "success": False,
             "url": product["url"],
             "error": f"Matched Buckingham product '{label}' but the datasheet could not be built: {e}",
+            "content": None,
+        }
+
+
+_BELITE_CATALOG_CACHE: dict = {"timestamp": 0.0, "products": []}
+_BELITE_CATALOG_LOCK = threading.Lock()
+
+
+def belite_get(url: str) -> str:
+    """GET a Belite page as UTF-8 text (the server does not declare charset)."""
+    try:
+        response = requests.get(
+            url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,*/*",
+                "Accept-Language": "en",
+            },
+        )
+    except Exception:
+        return ""
+
+    if response.status_code != 200:
+        return ""
+
+    response.encoding = "utf-8"
+    return response.text
+
+
+def parse_belite_product_page(product_url: str, html: str) -> dict:
+    """Read one Belite product page into an index entry."""
+    name_match = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.DOTALL)
+    name = clean_html_text(name_match.group(1)) if name_match else ""
+
+    specs = []
+    block = re.search(r'<div class="cx">(.*?)(?:<div class="[a-z]|<script)', html, flags=re.DOTALL)
+    if block:
+        for paragraph in re.findall(r"<p[^>]*>(.*?)</p>", block.group(1), flags=re.DOTALL):
+            text = clean_html_text(paragraph).replace("\xa0", " ").strip()
+            # Belite mixes the ASCII colon with the full width one.
+            parts = re.split(r"[:：]", text, maxsplit=1)
+            if len(parts) != 2:
+                continue
+
+            label, value = parts[0].strip(), parts[1].strip()
+            if label and len(label) <= 30:
+                specs.append((label, value))
+
+    images = []
+    for src in re.findall(r'src="([^"]*/data/upload/[^"]*\.(?:jpg|jpeg|png))"', html, flags=re.IGNORECASE):
+        full = src if src.startswith("http") else urljoin(BELITE_BASE_URL, src)
+        if full not in images:
+            images.append(full)
+
+    return {"url": product_url, "name": name, "specs": specs, "images": images}
+
+
+def fetch_belite_catalog(allow_build: bool = True) -> list[dict]:
+    """Build the Belite product index, cached hourly.
+
+    Products are only reachable through the category pages, so those are
+    crawled first and every product page is then read in parallel. Callers
+    that must stay responsive pass allow_build=False.
+    """
+    with _BELITE_CATALOG_LOCK:
+        age = time.time() - _BELITE_CATALOG_CACHE["timestamp"]
+        if _BELITE_CATALOG_CACHE["products"] and age < BELITE_CATALOG_TTL:
+            return _BELITE_CATALOG_CACHE["products"]
+
+        if not allow_build:
+            return []
+
+        root = belite_get(BELITE_PRODUCTS_URL)
+        if not root:
+            return []
+
+        categories = {urljoin(BELITE_BASE_URL, path) for path in re.findall(r'href="(/[A-Za-z][^"]*/)"', root)}
+        categories |= set(re.findall(r'href="(https://www\.vtop-led\.com/[^"]+/)"', root))
+        categories = {
+            c for c in categories
+            if not re.search(
+                r"(about|certificate|company|news|contact|download|projects|sitemap|themes)",
+                c,
+                flags=re.IGNORECASE,
+            )
+        }
+
+        product_urls = set()
+        for category in sorted(categories):
+            html = belite_get(category)
+            if not html:
+                continue
+            for url in re.findall(r'href="(https://www\.vtop-led\.com/[^"]+\.html)"', html):
+                product_urls.add(url)
+            for path in re.findall(r'href="(/[^"]+\.html)"', html):
+                product_urls.add(urljoin(BELITE_BASE_URL, path))
+
+        product_urls = {u for u in product_urls if not re.search(r"/(projects|news)/", u)}
+        if not product_urls:
+            return []
+
+        def load(product_url: str) -> dict | None:
+            html = belite_get(product_url)
+            if not html:
+                return None
+            entry = parse_belite_product_page(product_url, html)
+            return entry if entry["name"] else None
+
+        products = []
+        with ThreadPoolExecutor(max_workers=BELITE_INDEX_WORKERS) as executor:
+            for entry in executor.map(load, sorted(product_urls)):
+                if entry:
+                    products.append(entry)
+
+        if products:
+            _BELITE_CATALOG_CACHE["products"] = products
+            _BELITE_CATALOG_CACHE["timestamp"] = time.time()
+
+        return products
+
+
+def resolve_belite_product(query: str, products: list[dict]) -> tuple[dict | None, str]:
+    """Match a description to one Belite product.
+
+    Belite publishes no item codes, so products are identified by their long
+    descriptive names; the query is scored on how much of it the name covers.
+    """
+    query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query:
+        return None, "empty BELITE description"
+
+    key = query.casefold()
+    exact = [p for p in products if p["name"].casefold() == key]
+    if len(exact) == 1:
+        return exact[0], "exact name match"
+
+    query_tokens = set(fumagalli_tokens(query))
+    if not query_tokens:
+        return None, "nothing to match on"
+
+    scored = []
+    for product in products:
+        name_tokens = set(fumagalli_tokens(product["name"]))
+        if not name_tokens:
+            continue
+        shared = query_tokens & name_tokens
+        if len(shared) >= 2:
+            # Prefer the name that shares most with the query and adds least.
+            scored.append((len(shared), -len(name_tokens - query_tokens), product))
+
+    if not scored:
+        return None, f"no BELITE product matches '{query}'"
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    best = scored[0]
+    ties = [s for s in scored if (s[0], s[1]) == (best[0], best[1])]
+
+    if len(ties) > 1:
+        return None, "ambiguous between: " + "; ".join(t[2]["name"][:40] for t in ties[:4])
+
+    return best[2], f"matched '{best[2]['name'][:48]}'"
+
+
+def build_belite_datasheet(product: dict) -> bytes:
+    """Render a datasheet PDF from a Belite product page."""
+    page_width, page_height = 595.276, 841.89
+    buffer = io.BytesIO()
+    sheet = pdf_canvas.Canvas(buffer, pagesize=(page_width, page_height))
+
+    accent = HexColor(BELITE_ACCENT_COLOR)
+    muted = HexColor("#64748B")
+    line = HexColor("#DDE6F0")
+    margin = 48
+
+    sheet.setFillColor(accent)
+    sheet.rect(0, page_height - 96, page_width, 96, stroke=0, fill=1)
+    sheet.setFillColor(HexColor("#FFFFFF"))
+    sheet.setFont("Helvetica-Bold", 24)
+    sheet.drawString(margin, page_height - 52, "BELITE")
+    sheet.setFont("Helvetica", 10.5)
+    sheet.drawString(margin, page_height - 72, "Product specification")
+
+    y = page_height - 128
+
+    # Product name, wrapped
+    sheet.setFillColor(HexColor("#102033"))
+    sheet.setFont("Helvetica-Bold", 15)
+    words = to_pdf_text(product.get("name") or "Belite product").split()
+    current = ""
+    lines = []
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if sheet.stringWidth(candidate, "Helvetica-Bold", 15) <= page_width - 2 * margin:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    for text_line in lines[:3]:
+        sheet.drawString(margin, y, text_line)
+        y -= 19
+
+    sheet.setStrokeColor(accent)
+    sheet.setLineWidth(2)
+    sheet.line(margin, y - 2, margin + 60, y - 2)
+    y -= 26
+
+    # Product image on the left, specification on the right
+    image = None
+    for image_url in product.get("images", [])[:1]:
+        image = fetch_product_image(image_url, BELITE_BASE_URL)
+        if image is not None:
+            break
+
+    table_x = margin
+    table_width = page_width - 2 * margin
+    top_of_block = y
+
+    if image is not None:
+        box = 190.0
+        try:
+            iw, ih = image.getSize()
+            scale = min(box / iw, box / ih)
+            sheet.drawImage(
+                image,
+                margin,
+                y - box + (box - ih * scale) / 2,
+                width=iw * scale,
+                height=ih * scale,
+                mask="auto",
+                preserveAspectRatio=True,
+            )
+            table_x = margin + box + 22
+            table_width = page_width - margin - table_x
+        except Exception:
+            image = None
+
+    row_y = top_of_block
+    sheet.setFont("Helvetica-Bold", 11)
+    sheet.setFillColor(HexColor("#102033"))
+    sheet.drawString(table_x, row_y, "Specification")
+    row_y -= 16
+
+    for label, value in product.get("specs", [])[:16]:
+        if row_y < 120:
+            break
+
+        sheet.setStrokeColor(line)
+        sheet.setLineWidth(0.6)
+        sheet.line(table_x, row_y - 4, table_x + table_width, row_y - 4)
+
+        sheet.setFont("Helvetica", 9)
+        sheet.setFillColor(muted)
+        sheet.drawString(table_x, row_y, to_pdf_text(label)[:24])
+
+        sheet.setFont("Helvetica-Bold", 9)
+        sheet.setFillColor(HexColor("#102033"))
+        value_text = to_pdf_text(value)
+        while value_text and sheet.stringWidth(value_text, "Helvetica-Bold", 9) > table_width - 100:
+            value_text = value_text[:-1]
+        sheet.drawRightString(table_x + table_width, row_y, value_text)
+
+        row_y -= 16
+
+    sheet.setStrokeColor(line)
+    sheet.setLineWidth(0.8)
+    sheet.line(margin, 74, page_width - margin, 74)
+    sheet.setFont("Helvetica", 8)
+    sheet.setFillColor(muted)
+    sheet.drawString(margin, 60, "Source: " + product.get("url", BELITE_PRODUCTS_URL))
+    sheet.drawString(
+        margin,
+        48,
+        "Compiled from the official Belite product page on " + time.strftime("%Y-%m-%d"),
+    )
+
+    sheet.showPage()
+    sheet.save()
+    return buffer.getvalue()
+
+
+def download_belite_datasheet(query: str) -> dict:
+    """Build the datasheet for one Belite product."""
+    search_value = re.sub(r"\s+", " ", str(query or "")).strip()
+
+    if not search_value:
+        return {
+            "code": query,
+            "brand": "Belite",
+            "success": False,
+            "url": BELITE_PRODUCTS_URL,
+            "error": "Empty BELITE description.",
+            "content": None,
+        }
+
+    products = fetch_belite_catalog()
+
+    if not products:
+        return {
+            "code": query,
+            "brand": "Belite",
+            "success": False,
+            "url": BELITE_PRODUCTS_URL,
+            "error": "Could not load the BELITE product list from vtop-led.com.",
+            "content": None,
+        }
+
+    product, note = resolve_belite_product(search_value, products)
+
+    if product is None:
+        return {
+            "code": query,
+            "brand": "Belite",
+            "success": False,
+            "url": BELITE_PRODUCTS_URL,
+            "error": f"Could not match '{search_value}' to a BELITE product: {note}",
+            "content": None,
+        }
+
+    try:
+        content = build_belite_datasheet(product)
+        validate_pdf_content(content)
+
+        return {
+            "code": query,
+            "brand": "Belite",
+            "success": True,
+            "url": product["url"],
+            "error": "",
+            "content": content,
+        }
+
+    except Exception as e:
+        return {
+            "code": query,
+            "brand": "Belite",
+            "success": False,
+            "url": product["url"],
+            "error": (
+                f"Matched BELITE product '{product['name'][:40]}' but the datasheet "
+                f"could not be built: {e}"
+            ),
             "content": None,
         }
 
@@ -3103,6 +3473,8 @@ def download_datasheet(code: str) -> dict:
         return download_fumagalli_datasheet(strip_product_prefix(code))
     if product_type == "buckingham":
         return download_buckingham_datasheet(strip_product_prefix(code))
+    if product_type == "belite":
+        return download_belite_datasheet(strip_product_prefix(code))
 
     return {
         "code": code,
@@ -3110,7 +3482,7 @@ def download_datasheet(code: str) -> dict:
         "success": False,
         "url": "",
         "error": (
-            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA, LLU, OLY, LDZ or BUC. "
+            "Unknown code prefix. Codes must start with PHL, ZMB, TCMA, LLU, OLY, LDZ, BUC or BLT. "
             "FUM items are searched by their Description (FUMAGALLI box or Excel Description column)."
         ),
         "content": None,
@@ -3419,6 +3791,7 @@ st.markdown(
         --olympia-blue: #005BAA;
         --ledluz-orange: #E67E22;
         --buckingham-navy: #0F2B46;
+        --belite-green: #1B7A3E;
         --app-bg: #F6F8FB;
         --card-bg: #FFFFFF;
         --text-main: #102033;
@@ -3540,6 +3913,19 @@ st.markdown(
         letter-spacing: 2px;
         line-height: 1;
         box-shadow: 0 8px 20px rgba(0, 91, 170, 0.18);
+    }
+
+    .belite-logo {
+        background: var(--belite-green);
+        color: #ffffff;
+        border: 1px solid var(--belite-green);
+        border-radius: 4px;
+        padding: 9px 15px;
+        font-weight: 800;
+        font-size: 17px;
+        letter-spacing: 1.5px;
+        line-height: 1;
+        box-shadow: 0 8px 20px rgba(27, 122, 62, 0.16);
     }
 
     .buckingham-logo {
@@ -3820,6 +4206,8 @@ st.markdown(
         <div class="ledluz-logo">LEDLUZ</div>
         <div class="brand-divider"></div>
         <div class="buckingham-logo">BUCKINGHAM</div>
+        <div class="brand-divider"></div>
+        <div class="belite-logo">BELITE</div>
     </div>
 
 </div>
@@ -4000,6 +4388,14 @@ buckingham_count = len(
         or (i["kind"] == "code" and get_product_type(i["value"]) == "buckingham")
     ]
 )
+belite_count = len(
+    [
+        i
+        for i in all_items
+        if i["kind"] == "belite"
+        or (i["kind"] == "code" and get_product_type(i["value"]) == "belite")
+    ]
+)
 unknown_count = (
     len(all_items)
     - philips_count
@@ -4010,6 +4406,7 @@ unknown_count = (
     - olympia_count
     - ledluz_count
     - buckingham_count
+    - belite_count
 )
 
 st.markdown("### Summary before download")
@@ -4035,7 +4432,8 @@ with metric_3:
     brand_metric_7,
     brand_metric_8,
     brand_metric_9,
-) = st.columns(9)
+    brand_metric_10,
+) = st.columns(10)
 
 with brand_metric_1:
     st.metric("Philips", philips_count)
@@ -4062,6 +4460,9 @@ with brand_metric_8:
     st.metric("Buckingham", buckingham_count)
 
 with brand_metric_9:
+    st.metric("Belite", belite_count)
+
+with brand_metric_10:
     st.metric("Unknown", unknown_count)
 
 if all_items:
@@ -4121,6 +4522,20 @@ if all_items:
             if i["kind"] == "buckingham"
             or (i["kind"] == "code" and get_product_type(i["value"]) == "buckingham")
         ]
+
+        belite_items = [
+            i
+            for i in all_items
+            if i["kind"] == "belite"
+            or (i["kind"] == "code" and get_product_type(i["value"]) == "belite")
+        ]
+
+        belite_preview = []
+        if belite_items:
+            try:
+                belite_preview = fetch_belite_catalog(allow_build=False)
+            except Exception:
+                belite_preview = []
 
         buckingham_preview = []
         if buckingham_items:
@@ -4213,6 +4628,23 @@ if all_items:
                     )
                 else:
                     matched = "Checked during download"
+            elif item["kind"] == "belite" or product_type == "belite":
+                brand = "BELITE"
+                matched = "Checked during download"
+                if belite_preview:
+                    search_value = (
+                        strip_product_prefix(item["value"])
+                        if item["kind"] == "code"
+                        else item["value"]
+                    )
+                    matched_product, match_note = resolve_belite_product(
+                        search_value, belite_preview
+                    )
+                    matched = (
+                        matched_product["name"][:70]
+                        if matched_product
+                        else f"No match ({match_note})"
+                    )
             elif item["kind"] == "buckingham" or product_type == "buckingham":
                 brand = "Buckingham"
                 matched = "Checked during download"
@@ -4280,6 +4712,8 @@ if download_button:
             return download_ledluz_datasheet(value)
         if kind == "buckingham":
             return download_buckingham_datasheet(value)
+        if kind == "belite":
+            return download_belite_datasheet(value)
         return download_datasheet(value)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -4305,6 +4739,8 @@ if download_button:
                     brand = "LEDLUZ"
                 elif kind == "buckingham":
                     brand = "Buckingham"
+                elif kind == "belite":
+                    brand = "Belite"
                 else:
                     product_type = get_product_type(value)
                     if product_type == "philips":
@@ -4321,6 +4757,8 @@ if download_button:
                         brand = "LEDLUZ"
                     elif product_type == "buckingham":
                         brand = "Buckingham"
+                    elif product_type == "belite":
+                        brand = "Belite"
                     else:
                         brand = "Unknown"
 
